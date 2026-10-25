@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
 import { config, limits, ensureWorkspace } from './config.js';
 import { createJob, getJob, emit, loadSavedJobs, jobs } from './lib/jobs.js';
 import { runJob } from './lib/pipeline.js';
@@ -327,6 +328,38 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
   // eslint-disable-next-line no-console
   console.error(`[uncaughtException] ${new Date().toISOString()} ::`, err?.stack || err);
+});
+
+/* ── preflight ────────────────────────────────────────────────────────────
+ * A deploy platform ships only what npm installed. If python/yt-dlp/ffmpeg
+ * are absent the UI still loads, but every job would fail minutes later — so
+ * say it at boot. Warnings only: serving the site beats crashing on start. */
+const probe = (cmd, args) =>
+  new Promise((resolve) => {
+    try {
+      execFile(cmd, args, { timeout: 15_000, windowsHide: true }, (err) => resolve(!err));
+    } catch {
+      resolve(false);
+    }
+  });
+
+async function preflight() {
+  const missing = [];
+  if (!(await probe(config.ffmpeg, ['-version']))) missing.push('ffmpeg');
+  if (!(await probe(config.python, ['--version']))) missing.push('python3');
+  else if (!(await probe(config.python, ['-m', 'yt_dlp', '--version']))) missing.push('python3 -m yt_dlp');
+  if (!config.apiKey) missing.push('NVIDIA_API_KEY');
+  if (missing.length) {
+    // eslint-disable-next-line no-console
+    console.warn(`  ⚠ not available here: ${missing.join(', ')} — related steps will fail\n`);
+  }
+}
+preflight().catch(() => {});
+
+server.on('error', (err) => {
+  // eslint-disable-next-line no-console
+  console.error(`  ✗ could not listen on ${config.host}:${config.port} — ${err.message}`);
+  process.exitCode = 1;
 });
 
 server.listen(config.port, config.host, () => {

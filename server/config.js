@@ -28,7 +28,10 @@ const list = (value, fallback) =>
     .filter(Boolean);
 
 export const config = {
-  host: process.env.HOST || '127.0.0.1',
+  // 0.0.0.0 by default: on any deploy platform the app must be reachable from
+  // outside the container, and a loopback bind leaves the health check hanging
+  // forever. HOST still overrides it for local runs.
+  host: process.env.HOST || '0.0.0.0',
   port: Number(process.env.PORT || 3000),
   apiKey: process.env.NVIDIA_API_KEY || '',
   apiBase: (process.env.NVIDIA_API_BASE || 'https://integrate.api.nvidia.com/v1').replace(/\/+$/, ''),

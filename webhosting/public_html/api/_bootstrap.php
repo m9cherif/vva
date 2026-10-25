@@ -393,6 +393,7 @@ function archive_best_mp4(array $meta): ?array {
 
 function archive_file_url(array $meta, string $name): string {
     $server = rtrim((string) ($meta['server'] ?? 'archive.org'), '/');
+    if (!preg_match('#^https?://#i', $server)) $server = 'https://' . ltrim($server, '/');
     $dir = trim((string) ($meta['dir'] ?? ''), '/');
     $path = implode('/', array_map('rawurlencode', explode('/', $name)));
     return "{$server}/{$dir}/{$path}";

@@ -7,7 +7,7 @@ Reply with EXACTLY one JSON object: {"reason":"...","keep":[ids],"drop":[ids],"s
 Rules: keep only shown ids. Prefer duration >= MIN_DURATION and prefer CONTINUITY (one continuous subject) — but both are PREFERENCES, never hard filters: when nothing better is available, KEEP the best candidate you have. Completions/compilations are acceptable as a fallback once single-subject options are gone. Prefer strong covers/views; vary every query. NEVER end with keep=[] while candidates are on screen — pick the best of what exists. done:true only when enough are kept or the search budget is gone.`;
 export async function researchSources({category,need,minDuration,spare=0,source='youtube',log=()=>{}}){
   const target=need+spare;
-  const seen=new Map(),kept=[],dropped=new Set(),history=[];let pool=[],searches=0,round=0,lastQuery=null,malformed=0,stopped='';
+  const seen=new Map(),kept=[],dropped=new Set(),history=[];let pool=[],searches=0,round=0,lastQuery=null,malformed=0,stopped='',aiFails=0;
   const note=t=>log(t);
   note(`🤖 Agent researching "${category}" — needs ${need} videos (≥${minDuration}s)${spare?` (+${spare} spare)`:''}`);
   while(round<MAX_ROUNDS){
@@ -19,12 +19,12 @@ export async function researchSources({category,need,minDuration,spare=0,source=
     const user=`CATEGORY: ${category}\nSOURCE: ${srcLabel}\nQUERY STYLE: plain keyword phrases a person would actually type (e.g. "funny dog fails", "cat jumps") — never mention a platform, site name, "archive" or "vintage"; vary the wording every time.\nNEED: ${need} | KEPT: ${kept.length} | MIN_DURATION: ${minDuration}s\nSEARCHES: ${searches}/${MAX_SEARCHES} | TURN: ${round}/${MAX_ROUNDS}\n${lastQuery?`LAST QUERY: "${lastQuery}"`:'NO SEARCH YET — start with a query.'}\n\nKEPT SO FAR:\n${kept.map((v,i)=>`  ${i+1}. id=${v.id} "${v.title}" | ${v.duration}s | ${v.views} views`).join('\n')||'  (none)'}\nDROPPED: ${[...dropped].slice(-10).join(', ')||'(none)'}\n\nCANDIDATES${images.length?` — ${images.length} covers attached, in this exact order`:''}:\n${shown.map((v,i)=>`  ${i+1}. id=${v.id} | "${v.title}" | ${v.duration}s | ${v.views} views | ${v.channel}`).join('\n')||'  (none — you must search)'}\n\nReply with ONLY the JSON object.`;
     let text;
     try{({text}=await api.ai({system:SYSTEM,user,images,history,maxTokens:2500,temperature:0.3,attempts:2}));}
-    catch(e){note(`⚠ agent call failed: ${String(e.message||e).slice(0,140)}`);break;}
+    catch(e){aiFails++;note(`⚠ agent call failed (${String(e.message||e).slice(0,110)}) — retrying (${aiFails}/2)`);if(aiFails>2)break;history.push({role:'user',content:'Your previous reply did not arrive. Reply again with ONLY the JSON object specified.'});continue;}
     history.push({role:'assistant',content:text});history.push({role:'user',content:user});
     while(history.length>12)history.shift();
     const d=extractJson(text);
     if(!d||typeof d!=='object'||Array.isArray(d)){malformed++;if(malformed>=3){note('⚠ agent stopped: unusable decisions');break;}history.push({role:'user',content:'Reply with ONLY the JSON object specified.'});continue;}
-    malformed=0;
+    malformed=0;aiFails=0;
     const reason=String(d.reason||'').trim().slice(0,220);
     for(const id of Array.isArray(d.keep)?d.keep:[]){const c=seen.get(String(id));if(c&&!dropped.has(c.id)&&!kept.some(k=>k.id===c.id)){kept.push(c);note(`✅ kept "${c.title}" — ${c.duration}s · ${c.views} views`);}}
     for(const id of Array.isArray(d.drop)?d.drop:[]){const c=seen.get(String(id));if(c&&!kept.some(k=>k.id===c.id)&&!dropped.has(c.id)){dropped.add(c.id);note(`❌ dropped "${c.title}"${reason?` — ${reason}`:''}`);}}

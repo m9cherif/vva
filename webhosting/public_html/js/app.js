@@ -186,6 +186,9 @@ function handleEvent(ev) {
     case 'source':
       upsertSource(ev.source);
       break;
+    case 'sources-reset':
+      els.sources.innerHTML = '';
+      break;
     case 'clip-ready':
       addClipCard(ev.clip, true);
       break;

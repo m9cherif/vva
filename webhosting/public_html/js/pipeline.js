@@ -32,6 +32,10 @@ export async function runJob(params, emit) {
     stage: 'searching', percent: 0, logs: [], sources: [], clips: [], model: null, error: null,
   };
   const stage = (s, pct, msg) => { job.stage = s; job.percent = pct; emit({ type: 'stage', stage: s, percent: pct, message: msg }); };
+  /* Percent is monotone: a source fallback that rewinds a stage never makes
+   * the bar jump backwards. */
+  let pctSeen = 0;
+  const stageUp = (s, p, msg) => { pctSeen = Math.max(pctSeen, p || 0); stage(s, pctSeen, msg); };
   const log = (text) => { job.logs.push(text); emit({ type: 'log', text }); };
   const save = () => { api.saveJob(job).catch(() => {}); };
   const srcEvent = (entry) => emit({ type: 'source', source: entry });
@@ -40,82 +44,89 @@ export async function runJob(params, emit) {
     // warm up ffmpeg in the background while the agent researches
     ffmpeg().catch(() => {});
 
-    /* 0 ─ Choose a source this server can actually pull bytes from.
-     * Chain: YouTube (real viral content) → Pexels (free key, direct MP4) →
-     * Internet Archive (keyless, free forever, real Range support). Each tier
-     * is probed cheaply so the job never starts on a source that will fail. */
-    let source = 'youtube';
-    const explicit = params.source && params.source !== 'auto' ? params.source : '';
+    /* 0 ─ Source chain: YouTube → Pexels (if a key is configured) → Internet
+     * Archive (keyless, free forever). YouTube's player can resolve one probe
+     * and then refuse real videos — the bot check is per-request — so the
+     * fallback is driven by the ACTUAL stream resolution: when a tier yields
+     * nothing playable we drop its sources and re-run research on the next. */
+    const explicit = params.source && params.source !== 'auto' ? String(params.source) : '';
+    const candidates = explicit ? [explicit] : ['youtube'];
     if (explicit) {
-      source = explicit;
       log(`Source: ${explicit} (chosen explicitly)`);
     } else {
-      stage('searching', 2, 'Checking which video source this server can reach');
+      stageUp('searching', 2, 'Checking which video sources this server can reach');
       try {
-        await api.player('dQw4w9WgXcQ', 'youtube');
-        source = 'youtube';
-        log('Source: YouTube — stream downloads work from this server');
-      } catch (err) {
-        const msg = String(err.message || err);
-        log(`YouTube unavailable for this server (${msg.slice(0, 110)}) — probing fallback sources`);
-        // Pexels only if a key is configured (a missing key answers 400).
-        try {
-          await api.search('nature', 1, 'pexels');
-          source = 'pexels';
-          log('Source: Pexels — free key configured, direct MP4 files');
-        } catch {
+        await api.search('nature', 1, 'pexels');
+        candidates.push('pexels');
+        log('Pexels key configured — using it as the middle tier');
+      } catch { /* no key: skip that tier entirely */ }
+      candidates.push('archive');
+      log(`Source order: ${candidates.join(' → ')}`);
+    }
+
+    let source = candidates[0];
+    let resolved = [];
+    let sources = [];
+    let lastFailure = '';
+
+    for (let attempt = 0; attempt < candidates.length && resolved.length === 0; attempt += 1) {
+      source = candidates[attempt];
+      job.source = source;
+      if (attempt > 0) {
+        log(`↩︎ Falling back to "${source}" — ${lastFailure.slice(0, 110)}`);
+        job.sources = [];
+        emit({ type: 'sources-reset' });
+      }
+      stageUp('searching', 4, `AI agent is researching ${category} videos via ${source}`);
+      let turn = 0;
+      try {
+        /* 1 ─ AI research */
+        const found = await researchSources({
+          category, need: sourceCount, minDuration: clipLength + 10, spare: 2, source,
+          log: (text) => { turn += 1; log(text); stageUp('searching', Math.min(9, 4 + turn * 0.35), 'AI agent researching sources'); },
+        });
+        sources = found.videos;
+        if (!sources.length) throw new Error(`no videos found for "${category}" on this source`);
+        sources.forEach((v, i) => {
+          const provider = v.provider || 'youtube';
+          const isYouTube = provider === 'youtube';
+          job.sources.push({ id: v.id, provider, title: v.title, channel: v.channel, views: v.views, duration: v.duration,
+            url: isYouTube ? `https://www.youtube.com/watch?v=${v.id}` : (v.page || ''), thumb: api.thumb(v), status: 'queued', percent: 0, peakScore: null, avgScore: null });
+          log(`#${i + 1} ${v.title} — ${fmtViews(v.views)} views`);
+        });
+        save();
+
+        /* 2 ─ Stream resolution */
+        stageUp('downloading', 10, `Resolving streams for ${sources.length} videos`);
+        const got = [];
+        await mapPool(job.sources, 3, async (entry, idx) => {
           try {
-            await api.search('nature', 1, 'archive');
-            source = 'archive';
-            log('Source: Internet Archive — keyless, free forever, direct MP4 files');
-          } catch (err2) {
-            throw new Error(`No usable video source: YouTube blocks this server and the fallbacks failed (${String(err2.message || err2).slice(0, 140)}).`);
+            const info = await api.player(entry.id, entry.provider || source);
+            entry.duration = info.duration || entry.duration;
+            const videos = info.streams.filter((s) => s.kind === 'video' && s.mimeType.includes('mp4'));
+            const best = videos.filter((s) => s.height <= quality).sort((a, b) => b.height - a.height)[0]
+                       || videos.sort((a, b) => a.height - b.height)[0];
+            if (!best) throw new Error('no compatible video stream');
+            got.push({ entry, idx, best, info });
+          } catch (err) {
+            entry.status = 'failed'; srcEvent(entry);
+            log(`Skipped "${entry.title}" — ${String(err.message || err).slice(0, 160)}`);
           }
-        }
+        });
+        if (!got.length) throw new Error('none of the selected videos could be played from this server');
+        resolved = got;
+        log(`✅ source locked: ${source} (${resolved.length} playable video${resolved.length === 1 ? '' : 's'})`);
+      } catch (err) {
+        lastFailure = String(err.message || err);
+        log(`Source "${source}" failed — ${lastFailure.slice(0, 160)}`);
       }
     }
-    job.source = source;
-
-    /* 1 ─ AI research */
-    stage('searching', 4, `AI agent is researching ${category} videos`);
-    let turn = 0;
-    const { videos: sources } = await researchSources({
-      category, need: sourceCount, minDuration: clipLength + 10, spare: 2, source,
-      log: (text) => { turn++; log(text); stage('searching', Math.min(9, 4 + turn * 0.35), 'AI agent researching sources'); },
-    });
-    if (!sources.length) throw new Error(`No downloadable videos found for "${category}". Try another category.`);
-    sources.forEach((v, i) => {
-      const provider = v.provider || 'youtube';
-      const isYouTube = provider === 'youtube';
-      job.sources.push({ id: v.id, provider, title: v.title, channel: v.channel, views: v.views, duration: v.duration,
-        url: isYouTube ? `https://www.youtube.com/watch?v=${v.id}` : (v.page || ''), thumb: api.thumb(v), status: 'queued', percent: 0, peakScore: null, avgScore: null });
-      log(`#${i + 1} ${v.title} — ${fmtViews(v.views)} views`);
-    });
-    save();
-
-    /* 2 ─ Stream resolution */
-    stage('downloading', 10, `Resolving streams for ${sources.length} videos`);
-    const resolved = [];
-    await mapPool(job.sources, 3, async (entry, idx) => {
-      try {
-        const info = await api.player(entry.id, entry.provider || source);
-        entry.duration = info.duration || entry.duration;
-        const videos = info.streams.filter((s) => s.kind === 'video' && s.mimeType.includes('mp4'));
-        const best = videos.filter((s) => s.height <= quality).sort((a, b) => b.height - a.height)[0]
-                   || videos.sort((a, b) => a.height - b.height)[0];
-        if (!best) throw new Error('no compatible video stream');
-        resolved.push({ entry, idx, best, info });
-      } catch (err) {
-        entry.status = 'failed'; srcEvent(entry);
-        log(`Skipped "${entry.title}" — ${String(err.message || err).slice(0, 160)}`);
-      }
-    });
-    if (!resolved.length) throw new Error('No streams could be resolved — YouTube may be rate-limiting. Retry in a minute.');
+    if (!resolved.length) throw new Error(lastFailure || 'No streams could be resolved. Try again in a minute.');
 
     /* 2b ─ AI WATCHES A PREVIEW — before downloading any full window.
      * 12 seconds of bytes + 2 frames is enough for the vision model to judge
      * the footage, so weak sources are rejected before we pay for them. */
-    stage('downloading', 16, `AI previewing ${resolved.length} videos before downloading`);
+    stageUp('downloading', 16, `AI previewing ${resolved.length} videos before downloading`);
     const PREVIEW_SEC = 12;
     const previews = await mapPool(resolved, 3, async (r) => {
       try {
@@ -147,7 +158,7 @@ export async function runJob(params, emit) {
     });
 
     /* 2c ─ full window download — only for videos that passed the preview */
-    stage('downloading', 30, `Downloading ${survivors.length} video${survivors.length === 1 ? '' : 's'} that passed the preview`);
+    stageUp('downloading', 30, `Downloading ${survivors.length} video${survivors.length === 1 ? '' : 's'} that passed the preview`);
     const prepared = [];
     await mapPool(survivors, 3, async (r) => {
       const entry = r.entry;
@@ -168,7 +179,7 @@ export async function runJob(params, emit) {
     });
     if (!prepared.length) throw new Error('All source downloads failed — YouTube may be rate-limiting. Retry in a minute.');
     log(`${prepared.length}/${job.sources.length} videos passed the AI preview and are ready`);
-    stage('downloading', 40, 'Sampling frames from every video');
+    stageUp('downloading', 40, 'Sampling frames from every video');
 
     /* 3 ─ Frames */
     const analyze = [];
@@ -185,7 +196,7 @@ export async function runJob(params, emit) {
     if (!analyze.length) throw new Error('Could not sample frames from any source video.');
 
     /* 4 ─ Vision */
-    stage('watching', 42, 'AI vision model is watching every frame');
+    stageUp('watching', 42, 'AI vision model is watching every frame');
     const totalFrames = analyze.reduce((n, a) => n + a.frames.length, 0);
     let doneFrames = 0;
     await mapPool(analyze, 2, async (item) => {
@@ -205,14 +216,14 @@ export async function runJob(params, emit) {
             onBatch: (b) => {
               if (b.model && !job.model) { job.model = b.model; log(`Vision model in use: ${b.model}`); }
               doneFrames += b.done;
-              stage('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${doneFrames}/${totalFrames})`);
+              stageUp('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${doneFrames}/${totalFrames})`);
             },
           });
           freshScores = res.scores;
         }
         const scores = [...carried, ...freshScores].sort((a, b) => a.t - b.t);
         if (!scores.length) throw new Error('no frame scores');
-        stage('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${Math.min(doneFrames, totalFrames)}/${totalFrames})`);
+        stageUp('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${Math.min(doneFrames, totalFrames)}/${totalFrames})`);
         item.scores = scores;
         item.best = scores.reduce((m, s) => Math.max(m, s.score), 0);
         item.avg = Math.round(scores.reduce((n, s) => n + s.score, 0) / scores.length);
@@ -228,7 +239,7 @@ export async function runJob(params, emit) {
     if (!analyzed.length) throw new Error('The AI could not score any source video. Try running again.');
 
     /* 5 ─ Select highlight windows */
-    stage('selecting', 78, 'Ranking highlight windows across all videos');
+    stageUp('selecting', 78, 'Ranking highlight windows across all videos');
     let segments = selectSegments(analyzed, { clipCount, clipLength, interval });
     if (!segments.length) throw new Error('No highlight windows found for that clip length — try a shorter clip length.');
     if (segments.length < clipCount) log(`Only ${segments.length} of ${clipCount} clips available (sources too short)`);
@@ -236,18 +247,18 @@ export async function runJob(params, emit) {
     save();
 
     /* 6 ─ Cut clips with ffmpeg.wasm */
-    stage('cutting', 84, `Cutting ${segments.length} clips`);
+    stageUp('cutting', 84, `Cutting ${segments.length} clips`);
     const byId = new Map(analyzed.map((a) => [a.video.id, a]));
     const cut = [];
     for (let i = 0; i < segments.length; i += 1) {
       const seg = segments[i];
       const src = byId.get(seg.videoId);
       try {
-        stage('cutting', 84 + ((i) / segments.length) * 12, `Cutting clip ${i + 1} of ${segments.length}`);
+        stageUp('cutting', 84 + ((i) / segments.length) * 12, `Cutting clip ${i + 1} of ${segments.length}`);
         const blob = await cutClip({
           videoBlob: src.blob, audioBlob: null, startSec: seg.startSec,
           span: seg.endSec - seg.startSec, aspect,
-          onProgress: (p) => stage('cutting', 84 + ((i + p / 100) / segments.length) * 12, `Encoding clip ${i + 1} (${p}%)`),
+          onProgress: (p) => stageUp('cutting', 84 + ((i + p / 100) / segments.length) * 12, `Encoding clip ${i + 1} (${p}%)`),
         });
         const name = `clip_${String(i + 1).padStart(2, '0')}.mp4`;
         const up = await api.uploadClip(job.id, name, blob);
@@ -264,7 +275,7 @@ export async function runJob(params, emit) {
     if (!cut.length) throw new Error('ffmpeg could not render any clips.');
 
     /* 7 ─ Titles + hooks */
-    stage('cutting', 96, 'Writing titles and hooks');
+    stageUp('cutting', 96, 'Writing titles and hooks');
     const copy = await generateCopy(cut.map((c) => ({ videoTitle: c.videoTitle, channel: c.channel, startSec: c.startSec, endSec: c.endSec, highlights: c.highlights })));
     const byIndex = new Map();
     if (Array.isArray(copy)) for (const c of copy) { const n = Number(c?.index); if (Number.isFinite(n)) byIndex.set(n, c); }
@@ -272,13 +283,13 @@ export async function runJob(params, emit) {
 
     /* 8 ─ Finish */
     job.status = 'done'; job.finishedAt = Date.now();
-    stage('done', 100, `${job.clips.length} clips ready`);
+    stageUp('done', 100, `${job.clips.length} clips ready`);
     log(`Done — ${job.clips.length} clip${job.clips.length === 1 ? '' : 's'} ready to preview`);
     save();
     emit({ type: 'result', clips: job.clips, model: job.model, sources: job.sources });
   } catch (err) {
     job.status = 'error'; job.error = String(err?.message || err); job.finishedAt = Date.now();
-    stage('error', job.percent, job.error);
+    stageUp('error', job.percent, job.error);
     log(`ERROR: ${job.error}`);
     save();
     emit({ type: 'error', message: job.error });

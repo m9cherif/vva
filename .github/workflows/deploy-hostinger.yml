@@ -25,6 +25,7 @@ jobs:
       - name: Recreate .env
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: |
           if [ -z "$NVIDIA_API_KEY" ]; then
             echo "::error::Secret NVIDIA_API_KEY is not set on the repository"
@@ -33,6 +34,8 @@ jobs:
           {
             echo "NVIDIA_API_KEY=$NVIDIA_API_KEY"
             echo "NVIDIA_API_BASE=https://integrate.api.nvidia.com/v1"
+            # Optional: enables the Pexels fallback when YouTube blocks the host.
+            if [ -n "$PEXELS_API_KEY" ]; then echo "PEXELS_API_KEY=$PEXELS_API_KEY"; fi
           } > webhosting/public_html/.env
 
       # Dot-prefixed name: .htaccess denies every dotfile, so the archive can

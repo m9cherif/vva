@@ -12,6 +12,31 @@ require __DIR__ . '/_bootstrap.php';
 
 $id = (string) ($_GET['id'] ?? '');
 $res = (string) ($_GET['res'] ?? 'hqdefault');
+$provider = strtolower((string) ($_GET['provider'] ?? 'youtube'));
+$url = (string) ($_GET['url'] ?? '');
+
+/* Pexels covers are proxied by absolute URL — the host allowlist keeps this
+ * from becoming an open proxy. */
+if ($provider === 'pexels') {
+    if ($url === '' || !preg_match('#^https://#i', $url)) fail('missing image url', 400);
+    $host = parse_url($url, PHP_URL_HOST);
+    if (!is_string($host) || !is_youtube_cdn_host($host)) fail('image host not allowed', 403);
+    $cache = cfg()['cacheDir'] . '/px_' . md5($url) . '.jpg';
+    if (is_file($cache) && (time() - filemtime($cache)) < 86400 && filesize($cache) > 500) {
+        header('Content-Type: image/jpeg');
+        header('Cache-Control: public, max-age=86400');
+        readfile($cache);
+        exit;
+    }
+    $bytes = http_get_bytes($url, null, 20);
+    if ($bytes === null || strlen($bytes) < 500) fail('thumbnail unavailable', 404);
+    @file_put_contents($cache, $bytes, LOCK_EX);
+    header('Content-Type: image/jpeg');
+    header('Cache-Control: public, max-age=86400');
+    echo $bytes;
+    exit;
+}
+
 if (!preg_match('/^[A-Za-z0-9_-]{11}$/', $id)) fail('invalid video id', 400);
 if (!in_array($res, ['hqdefault', 'mqdefault', 'maxresdefault', 'sddefault'], true)) $res = 'hqdefault';
 

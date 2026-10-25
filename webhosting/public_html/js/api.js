@@ -27,18 +27,18 @@ async function request(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT) {
 export const api = {
   categories: () => request('/api/categories.php'),
 
-  search: (query, limit) =>
+  search: (query, limit, source = 'youtube') =>
     request('/api/search.php', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, limit }),
+      body: JSON.stringify({ query, limit, source }),
     }, 60_000),
 
-  player: (id) =>
+  player: (id, provider = 'youtube') =>
     request('/api/player.php', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id }),
+      body: JSON.stringify({ id, provider }),
     }, 45_000),
 
   /* AI calls can legitimately take minutes on a cold vision model. */
@@ -49,7 +49,13 @@ export const api = {
       body: JSON.stringify(payload),
     }, 200_000),
 
-  thumb: (id) => `/api/thumb.php?id=${encodeURIComponent(id)}`,
+  /* Cover image, always same-origin (COEP isolation + the agent needs bytes).
+   * Accepts an id string or a full video object ({id, provider, thumb}). */
+  thumb: (video) => {
+    const v = typeof video === 'string' ? { id: video } : (video || {});
+    if (v.provider === 'pexels') return `/api/thumb.php?provider=pexels&url=${encodeURIComponent(v.thumb || '')}`;
+    return `/api/thumb.php?id=${encodeURIComponent(v.id || '')}`;
+  },
 
   jobs: () => request('/api/jobs.php'),
   job: (id) => request(`/api/jobs.php?id=${encodeURIComponent(id)}`),

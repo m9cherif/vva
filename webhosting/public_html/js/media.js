@@ -51,7 +51,7 @@ function seek(video, t) {
 
 /* ── vision scoring ─────────────────────────────────────────────────────── */
 const SCORING_SYSTEM=`You are a senior short-form video editor and virality analyst.
-You are shown consecutive frames sampled from a single YouTube video, in chronological order.
+You are shown consecutive frames sampled from a single video, in chronological order.
 Judge each frame on its viral potential as a standalone social clip: genuine emotion and reactions, spectacle or skill, surprise and tension, humor, strong faces, visual clarity, and a payoff. Blurry, static, logo-only, dead-air or uneventful frames must score low. Use the whole 0-100 range.
 Think briefly, then reply with ONLY the JSON you were asked for.`;
 
@@ -79,7 +79,7 @@ export async function scoreFrames(frames, { interval, videoTitle, batch = 10, on
 
 /* ── copywriting ────────────────────────────────────────────────────────── */
 export async function generateCopy(segments) {
-  const user=`Here are ${segments.length} video segments chosen from real YouTube videos for their viral potential.\n\n${segments.map((s,i)=>`${i+1}. Source video: "${s.videoTitle}" (channel: ${s.channel}). Clip runs ${clock(s.startSec)}-${clock(s.endSec)}. Observed moments: ${(s.highlights||[]).filter(Boolean).join('; ')||'action beats'}`).join('\n')}\n\nReturn ONLY a JSON array of ${segments.length} objects in the same order:\n[{"index":1,"title":"<max 60 chars>","hook":"<max 120 chars>","caption":"<2 sentence caption>","hashtags":["#one","#two"]}, ...]`;
+  const user=`Here are ${segments.length} video segments chosen for their viral potential.\n\n${segments.map((s,i)=>`${i+1}. Source video: "${s.videoTitle}" (channel: ${s.channel}). Clip runs ${clock(s.startSec)}-${clock(s.endSec)}. Observed moments: ${(s.highlights||[]).filter(Boolean).join('; ')||'action beats'}`).join('\n')}\n\nReturn ONLY a JSON array of ${segments.length} objects in the same order:\n[{"index":1,"title":"<max 60 chars>","hook":"<max 120 chars>","caption":"<2 sentence caption>","hashtags":["#one","#two"]}, ...]`;
   try {
     const { text } = await api.ai({ system: 'You write punchy, click-worthy but honest packaging for short viral clips. Reply with ONLY the JSON array requested.', user, maxTokens: 3200, temperature: 0.7 });
     const parsed = extractJson(text);

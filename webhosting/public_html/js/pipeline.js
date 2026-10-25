@@ -40,17 +40,42 @@ export async function runJob(params, emit) {
     // warm up ffmpeg in the background while the agent researches
     ffmpeg().catch(() => {});
 
+    /* 0 ─ Choose a source this server can actually pull bytes from.
+     * YouTube is preferred (real viral content); when its player API refuses
+     * this server's IP we fall back to Pexels — direct MP4, free forever. */
+    let source = 'youtube';
+    if (params.source === 'pexels') {
+      source = 'pexels';
+      log('Source: Pexels (chosen explicitly)');
+    } else if (!params.source || params.source === 'auto') {
+      stage('searching', 2, 'Checking which video source this server can reach');
+      try {
+        await api.player('dQw4w9WgXcQ', 'youtube');
+        log('Source: YouTube — stream downloads work from this server');
+      } catch (err) {
+        const msg = String(err.message || err);
+        if (/LOGIN_REQUIRED|not playable|\b409\b|bot|captcha/i.test(msg)) {
+          source = 'pexels';
+          log(`👀 YouTube blocks this server's IP (${msg.slice(0, 90)}) — switching source to Pexels (free, no key stored in git)`);
+        } else {
+          log(`YouTube probe failed (${msg.slice(0, 120)}) — trying YouTube anyway`);
+        }
+      }
+    }
+    job.source = source;
+
     /* 1 ─ AI research */
     stage('searching', 4, `AI agent is researching ${category} videos`);
     let turn = 0;
     const { videos: sources } = await researchSources({
-      category, need: sourceCount, minDuration: clipLength + 10, spare: 2,
+      category, need: sourceCount, minDuration: clipLength + 10, spare: 2, source,
       log: (text) => { turn++; log(text); stage('searching', Math.min(9, 4 + turn * 0.35), 'AI agent researching sources'); },
     });
     if (!sources.length) throw new Error(`No downloadable videos found for "${category}". Try another category.`);
     sources.forEach((v, i) => {
-      job.sources.push({ id: v.id, title: v.title, channel: v.channel, views: v.views, duration: v.duration,
-        url: `https://www.youtube.com/watch?v=${v.id}`, thumb: api.thumb(v.id), status: 'queued', percent: 0, peakScore: null, avgScore: null });
+      const isPexels = (v.provider || 'youtube') === 'pexels';
+      job.sources.push({ id: v.id, provider: isPexels ? 'pexels' : 'youtube', title: v.title, channel: v.channel, views: v.views, duration: v.duration,
+        url: isPexels ? (v.page || '') : `https://www.youtube.com/watch?v=${v.id}`, thumb: api.thumb(v), status: 'queued', percent: 0, peakScore: null, avgScore: null });
       log(`#${i + 1} ${v.title} — ${fmtViews(v.views)} views`);
     });
     save();
@@ -60,7 +85,7 @@ export async function runJob(params, emit) {
     const resolved = [];
     await mapPool(job.sources, 3, async (entry, idx) => {
       try {
-        const info = await api.player(entry.id);
+        const info = await api.player(entry.id, entry.provider || source);
         entry.duration = info.duration || entry.duration;
         const videos = info.streams.filter((s) => s.kind === 'video' && s.height > 0 && s.mimeType.includes('mp4'));
         const best = videos.filter((s) => s.height <= quality).sort((a, b) => b.height - a.height)[0]

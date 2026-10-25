@@ -11,6 +11,45 @@ require __DIR__ . '/_bootstrap.php';
 
 $in = json_in();
 $id = trim((string) ($in['id'] ?? ''));
+$provider = strtolower((string) ($in['provider'] ?? 'youtube'));
+
+/* ── Pexels: direct progressive MP4 files, no signing, no bot check ─────── */
+if ($provider === 'pexels') {
+    if (!preg_match('/^\d{1,12}$/', $id)) fail('invalid video id');
+    try {
+        $d = pexels_api('/videos/videos/' . rawurlencode($id));
+        $files = [];
+        foreach (($d['video_files'] ?? []) as $f) {
+            if (!is_array($f) || empty($f['link'])) continue;
+            if (($f['file_type'] ?? '') !== 'video/mp4') continue;
+            $files[] = [
+                'itag' => 0,
+                'kind' => 'video',
+                'url' => (string) $f['link'],
+                'mimeType' => 'video/mp4',
+                'width' => (int) ($f['width'] ?? 0),
+                'height' => (int) ($f['height'] ?? 0),
+                'fps' => 0, 'bitrate' => 0,
+                'contentLength' => 0,      // probed on demand by range.php
+                'audioQuality' => '',
+            ];
+        }
+        if (!$files) fail('no downloadable mp4 files for this video', 409);
+        usort($files, fn($a, $b) => $b['height'] <=> $a['height']);
+        json_out([
+            'id' => $id,
+            'provider' => 'pexels',
+            'duration' => (int) ($d['duration'] ?? 0),
+            'title' => trim(($d['title'] ?? '') ?: ('Pexels video ' . $id)),
+            'channel' => (string) ($d['user']['name'] ?? 'Pexels'),
+            'views' => 0,
+            'streams' => $files,
+        ]);
+    } catch (Throwable $e) {
+        fail('Pexels stream resolution failed: ' . $e->getMessage(), 502);
+    }
+}
+if ($provider !== 'youtube') fail("unknown provider \"{$provider}\" (use youtube or pexels)");
 if (!preg_match('/^[A-Za-z0-9_-]{11}$/', $id)) fail('invalid video id');
 
 try {

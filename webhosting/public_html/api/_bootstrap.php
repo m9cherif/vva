@@ -67,6 +67,9 @@ function cfg(): array {
         'dataDir'   => $root . '/data',
         'cacheDir'  => $root . '/data/cache',
         'jobsDir'   => $root . '/data/jobs',
+        // Free-forever direct-MP4 source (https://www.pexels.com/api/).
+        // Empty until the key is added — the app then stays on YouTube.
+        'pexelsKey' => trim((string) env_get('PEXELS_API_KEY', '')),
     ];
     foreach (['dataDir', 'cacheDir', 'jobsDir'] as $d) {
         if (!is_dir($c[$d])) @mkdir($c[$d], 0775, true);
@@ -149,6 +152,37 @@ function http_post_json(string $url, array $body, array $headers = [], int $time
     ]]);
     $out = @file_get_contents($url, false, $ctx);
     if ($out === false) throw new RuntimeException('HTTP request failed: ' . implode(' ', $http_response_header ?? []));
+    $status = 0;
+    if (($http_response_header ?? []) && preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) $status = (int) $m[1];
+    return ['status' => $status, 'body' => (string) $out];
+}
+
+/** GET returning ['status' => int, 'body' => string] — same shape as http_post_json. */
+function http_get_json(string $url, array $headers = [], int $timeout = 30): array {
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json'], $headers),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_ENCODING => '',
+            CURLOPT_USERAGENT => UA_BROWSER,
+        ]);
+        $out = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if ($out === false) throw new RuntimeException('HTTP request failed: ' . curl_strerror(0));
+        return ['status' => $status, 'body' => (string) $out];
+    }
+    $ctx = stream_context_create(['http' => [
+        'header' => implode("\r\n", array_merge(['Accept: application/json', 'User-Agent: ' . UA_BROWSER], $headers)),
+        'timeout' => $timeout, 'ignore_errors' => true, 'follow_location' => 1,
+    ]]);
+    $out = @file_get_contents($url, false, $ctx);
+    if ($out === false) throw new RuntimeException('HTTP request failed');
     $status = 0;
     if (($http_response_header ?? []) && preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) $status = (int) $m[1];
     return ['status' => $status, 'body' => (string) $out];
@@ -253,10 +287,53 @@ function parse_views(string $text): int {
     return (int) round((float) $n * $mult);
 }
 
-/** True only for hosts we are willing to relay bytes from (SSRF guard). */
+/** True only for hosts we are willing to relay bytes from (SSRF guard).
+ *  Covers the YouTube CDN plus the Pexels CDN used by the fallback source. */
 function is_youtube_cdn_host(string $host): bool {
     $host = strtolower($host);
     return $host === 'googlevideo.com' || str_ends_with($host, '.googlevideo.com')
         || $host === 'ytimg.com' || str_ends_with($host, '.ytimg.com')
-        || $host === 'youtube.com' || str_ends_with($host, '.youtube.com');
+        || $host === 'youtube.com' || str_ends_with($host, '.youtube.com')
+        || $host === 'pexels.com' || str_ends_with($host, '.pexels.com');
+}
+
+/* ── Pexels source (free forever: https://www.pexels.com/api/) ──────────────
+ * Used when YouTube's player API refuses this server's IP. Direct progressive
+ * MP4 files, so the byte-range downloader and the ffmpeg cutting stage work
+ * unchanged. */
+function pexels_available(): bool {
+    return cfg()['pexelsKey'] !== '';
+}
+
+function pexels_api(string $pathAndQuery): array {
+    if (!pexels_available()) fail('PEXELS_API_KEY is not set in .env — add the free key from pexels.com/api to use this source', 400);
+    $res = http_get_json('https://api.pexels.com' . $pathAndQuery, ['Authorization: ' . cfg()['pexelsKey']], 30);
+    if ($res['status'] !== 200) {
+        fail('Pexels API returned HTTP ' . $res['status'] . ': ' . mb_substr(preg_replace('/\s+/', ' ', $res['body']), 0, 180), 502);
+    }
+    $d = json_decode($res['body'], true);
+    if (!is_array($d)) fail('Pexels API returned malformed data', 502);
+    return $d;
+}
+
+/** Normalize a Pexels video object into the shape the research agent expects. */
+function pexels_normalize(array $v, string $query): ?array {
+    $dur = (int) ($v['duration'] ?? 0);
+    if ($dur < limits()['minSourceDurationSec'] || $dur > limits()['maxSourceDurationSec']) return null;
+    $id = (string) ($v['id'] ?? '');
+    if ($id === '') return null;
+    $who = (string) ($v['user']['name'] ?? '');
+    $photos = $v['video_pictures'] ?? [];
+    $cover = (string) ($photos[0]['picture'] ?? $v['image'] ?? '');
+    return [
+        'id' => $id,
+        'title' => trim(($query !== '' ? $query : 'Stock footage') . ($who !== '' ? " — {$who}" : '')),
+        'channel' => $who !== '' ? $who : 'Pexels',
+        'duration' => $dur,
+        'views' => 0,
+        'thumb' => $cover,
+        'live' => false,
+        'provider' => 'pexels',
+        'page' => (string) ($v['url'] ?? ''),
+    ];
 }

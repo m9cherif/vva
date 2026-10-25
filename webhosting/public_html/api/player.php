@@ -61,11 +61,18 @@ if ($provider === 'archive') {
         // lists restricted files that answer 403 to every range request.
         $urls = [];
         foreach ($candidates as $i => $f) $urls[$i] = archive_file_url($meta, $f['name']);
-        $ok = archive_probe_urls($urls, 10);
+        $ok = archive_probe_urls($urls, 15);
         $file = null;
         $streamUrl = '';
-        foreach ($candidates as $i => $f) {
-            if (!empty($ok[$urls[$i]])) { $file = $f; $streamUrl = $urls[$i]; break; }
+        foreach ($candidates as $i => $f) {            // faststart first: the
+            if (!empty($ok[$urls[$i]]['faststart'])) { // browser can decode it
+                $file = $f; $streamUrl = $urls[$i]; break;
+            }
+        }
+        if (!$file) {
+            foreach ($candidates as $i => $f) {
+                if (!empty($ok[$urls[$i]]['ok'])) { $file = $f; $streamUrl = $urls[$i]; break; }
+            }
         }
         if (!$file) fail('the mp4 files of this item are not downloadable (HTTP 403)', 409);
         $md = is_array($meta['metadata'] ?? null) ? $meta['metadata'] : [];

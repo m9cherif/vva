@@ -57,20 +57,21 @@ if ($source === 'archive') {
         }
         usort($videos, fn($a, $b) => $b['views'] <=> $a['views']);
 
-        // Archive.org lists files that are not downloadable (HTTP 403). Only
-        // hand candidates to the AI whose bytes we could actually range-read,
-        // otherwise a job dies after the agent has already picked them.
+        // Prefer files that decode from a prefix (moov up front); fall back to
+        // merely-downloadable ones rather than returning nothing at all.
+        // Only the top of the ranked list is probed — 30 × 256 KB max.
         $probe = [];
-        foreach ($videos as $v) {
+        foreach (array_slice($videos, 0, 30) as $v) {
             if (isset($metas[$v['id']])) $probe[$v['id']] = archive_file_url($metas[$v['id']], $v['file']);
         }
-        $ok = archive_probe_urls($probe, 8);
-        $checked = count(array_filter($ok));
-        $videos = array_values(array_filter($videos, fn($v) => !empty($ok[$probe[$v['id']] ?? ''])));
+        $ok = archive_probe_urls($probe, 15);
+        $prefer = array_keys(array_filter($ok, fn($v) => $v['ok'] && $v['faststart']));
+        if (!$prefer) $prefer = array_keys(array_filter($ok, fn($v) => $v['ok']));
+        $videos = array_values(array_filter($videos, fn($v) => in_array($probe[$v['id']] ?? '', $prefer, true)));
         json_out([
             'query' => $query, 'source' => 'archive',
             'videos' => array_slice($videos, 0, $limit),
-            'checked' => $checked, 'downloadable' => count($videos),
+            'checked' => count($ok), 'downloadable' => count($prefer),
         ]);
     } catch (Throwable $e) {
         fail('Archive.org search failed: ' . $e->getMessage(), 502);

@@ -404,19 +404,23 @@ function archive_file_url(array $meta, string $name): string {
     return "{$server}/{$dir}/{$path}";
 }
 
-/** Range-probe many file URLs in parallel → [url => bool].
- *  Archive.org lists files that are not actually downloadable (HTTP 403), so
- *  a candidate is only offered to the pipeline after its bytes were seen. */
-function archive_probe_urls(array $urls, int $timeout = 10): array {
+/** Range-probe many file URLs in parallel → [url => ['ok' => bool, 'faststart' => bool]].
+ *  Two things kill a candidate before the AI ever sees it: archive.org lists
+ *  files that are not downloadable (HTTP 403), and files whose `moov` atom
+ *  sits at the END — those cannot be decoded from the downloaded prefix, so
+ *  frame sampling would fail. The probe reads the same first 256 KB the
+ *  downloader fetches and checks for `moov` in it. */
+function archive_probe_urls(array $urls, int $timeout = 15, int $bytes = 262144): array {
     $urls = array_values(array_unique($urls));
-    $out = array_fill_keys($urls, false);
+    $out = [];
+    foreach ($urls as $u) $out[$u] = ['ok' => false, 'faststart' => false];
     if (!$urls || !function_exists('curl_multi_init')) return $out;
     $mh = curl_multi_init();
     $handles = [];
     foreach ($urls as $u) {
         $ch = curl_init($u);
         curl_setopt_array($ch, [
-            CURLOPT_HTTPHEADER => ['Range: bytes=0-1023'],
+            CURLOPT_HTTPHEADER => ['Range: bytes=0-' . ($bytes - 1)],
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_MAXREDIRS => 3,
@@ -433,7 +437,9 @@ function archive_probe_urls(array $urls, int $timeout = 10): array {
     } while ($active && $status === CURLM_OK);
     foreach ($handles as $u => $ch) {
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        $out[$u] = ($code === 206 || $code === 200);
+        $body = (string) curl_multi_getcontent($ch);
+        $ok = ($code === 206 || $code === 200) && $body !== '';
+        $out[$u] = ['ok' => $ok, 'faststart' => $ok && str_contains(substr($body, 0, $bytes), 'moov')];
         curl_multi_remove_handle($mh, $ch);
         curl_close($ch);
     }

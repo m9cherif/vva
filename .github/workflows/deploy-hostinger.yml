@@ -85,9 +85,11 @@ jobs:
           echo "  stream: $(head -c 90 <<<"$url")…"
 
           echo "→ byte relay (range.php)"
-          enc=$(printf '%s' "$url" | basenc --base64url | tr -d '=')
-          code=$(curl -s -o /tmp/chunk.bin -D /tmp/chunk.h -w '%{http_code}' --max-time 60 \
-            -H 'Range: bytes=0-65535' "https://vva.chrif.net/api/range.php?u=$enc" || true)
+          enc=$(printf '%s' "$url" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+          echo "  u param: $(printf '%s' "$enc" | cut -c1-60)… (${#enc} chars)"
+          code=$(curl -sS -o /tmp/chunk.bin -D /tmp/chunk.h -w '%{http_code}' --max-time 60 \
+            -H 'Range: bytes=0-65535' "https://vva.chrif.net/api/range.php?u=$enc" 2>/tmp/curl.err || true)
+          echo "  curl -> ${code:-000} $(head -c 200 /tmp/curl.err 2>/dev/null)"
           [ "$code" = "206" ] || fail "range relay returned $code"
           grep -qi '^content-range: bytes 0-65535/' /tmp/chunk.h || fail "missing Content-Range"
           head -c 12 /tmp/chunk.bin | grep -q ftyp || fail "first bytes are not an mp4"

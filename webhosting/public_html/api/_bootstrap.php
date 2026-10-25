@@ -370,25 +370,30 @@ function archive_parse_length(string $raw): int {
     return (int) floor((float) $raw);
 }
 
-/** Best mp4 derivative of an item: prefer real dimensions, then file size. */
-function archive_best_mp4(array $meta): ?array {
-    $best = null;
+/** Every mp4 derivative of an item, best first: real dimensions, then size. */
+function archive_mp4_files(array $meta): array {
+    $out = [];
     foreach (($meta['files'] ?? []) as $f) {
         if (!is_array($f)) continue;
         $name = (string) ($f['name'] ?? '');
         if (!preg_match('/\.mp4$/i', $name)) continue;
         $size = (int) ($f['size'] ?? 0);
         $w = (int) ($f['width'] ?? 0);
-        $score = $w * 1000 + min($size, 3_000_000_000) / 1e6;
-        if ($best === null || $score > $best['score']) {
-            $best = [
-                'score' => $score, 'name' => $name, 'size' => $size,
-                'width' => $w, 'height' => (int) ($f['height'] ?? 0),
-                'length' => (string) ($f['length'] ?? ''), 'format' => (string) ($f['format'] ?? ''),
-            ];
-        }
+        $out[] = [
+            'score' => $w * 1000 + min($size, 3_000_000_000) / 1e6,
+            'name' => $name, 'size' => $size,
+            'width' => $w, 'height' => (int) ($f['height'] ?? 0),
+            'length' => (string) ($f['length'] ?? ''), 'format' => (string) ($f['format'] ?? ''),
+        ];
     }
-    return $best;
+    usort($out, fn($a, $b) => $b['score'] <=> $a['score']);
+    return $out;
+}
+
+/** Best mp4 derivative of an item: prefer real dimensions, then file size. */
+function archive_best_mp4(array $meta): ?array {
+    $all = archive_mp4_files($meta);
+    return $all ? $all[0] : null;
 }
 
 function archive_file_url(array $meta, string $name): string {
@@ -397,6 +402,43 @@ function archive_file_url(array $meta, string $name): string {
     $dir = trim((string) ($meta['dir'] ?? ''), '/');
     $path = implode('/', array_map('rawurlencode', explode('/', $name)));
     return "{$server}/{$dir}/{$path}";
+}
+
+/** Range-probe many file URLs in parallel → [url => bool].
+ *  Archive.org lists files that are not actually downloadable (HTTP 403), so
+ *  a candidate is only offered to the pipeline after its bytes were seen. */
+function archive_probe_urls(array $urls, int $timeout = 10): array {
+    $urls = array_values(array_unique($urls));
+    $out = array_fill_keys($urls, false);
+    if (!$urls || !function_exists('curl_multi_init')) return $out;
+    $mh = curl_multi_init();
+    $handles = [];
+    foreach ($urls as $u) {
+        $ch = curl_init($u);
+        curl_setopt_array($ch, [
+            CURLOPT_HTTPHEADER => ['Range: bytes=0-1023'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 6,
+            CURLOPT_USERAGENT => UA_BROWSER,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$u] = $ch;
+    }
+    do {
+        $status = curl_multi_exec($mh, $active);
+        if ($active) curl_multi_select($mh, 1.0);
+    } while ($active && $status === CURLM_OK);
+    foreach ($handles as $u => $ch) {
+        $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $out[$u] = ($code === 206 || $code === 200);
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+    }
+    curl_multi_close($mh);
+    return $out;
 }
 
 /** Normalize an archive item into the shape the research agent expects. */

@@ -55,8 +55,19 @@ if ($provider === 'archive') {
     try {
         $meta = archive_metadata($id);
         if (!$meta) fail('archive item not found', 404);
-        $file = archive_best_mp4($meta);
-        if (!$file) fail('this archive item has no mp4 file', 409);
+        $candidates = archive_mp4_files($meta);
+        if (!$candidates) fail('this archive item has no mp4 file', 409);
+        // Pick a derivative we have actually read bytes from — archive.org
+        // lists restricted files that answer 403 to every range request.
+        $urls = [];
+        foreach ($candidates as $i => $f) $urls[$i] = archive_file_url($meta, $f['name']);
+        $ok = archive_probe_urls($urls, 10);
+        $file = null;
+        $streamUrl = '';
+        foreach ($candidates as $i => $f) {
+            if (!empty($ok[$urls[$i]])) { $file = $f; $streamUrl = $urls[$i]; break; }
+        }
+        if (!$file) fail('the mp4 files of this item are not downloadable (HTTP 403)', 409);
         $md = is_array($meta['metadata'] ?? null) ? $meta['metadata'] : [];
         $title = (string) ($md['title'] ?? $id);
         if (is_array($title)) $title = (string) ($title[0] ?? $id);
@@ -72,7 +83,7 @@ if ($provider === 'archive') {
             'streams' => [[
                 'itag' => 0,
                 'kind' => 'video',
-                'url' => archive_file_url($meta, $file['name']),
+                'url' => $streamUrl,
                 'mimeType' => 'video/mp4',
                 'width' => $file['width'],
                 'height' => $file['height'],

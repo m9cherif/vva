@@ -47,7 +47,7 @@ if ($source === 'archive') {
         $docs = $data['response']['docs'] ?? [];
         if (!is_array($docs) || !$docs) json_out(['query' => $query, 'source' => 'archive', 'videos' => []]);
 
-        $metas = archive_metadata_bulk(array_map(fn($d) => (string) ($d['identifier'] ?? ''), $docs));
+        $metas = archive_metadata_bulk(array_map(fn($d) => (string) ($d['identifier'] ?? ''), $docs), 45);
         $videos = [];
         foreach ($docs as $doc) {
             $id = (string) ($doc['identifier'] ?? '');
@@ -56,7 +56,22 @@ if ($source === 'archive') {
             if ($n) $videos[] = $n;
         }
         usort($videos, fn($a, $b) => $b['views'] <=> $a['views']);
-        json_out(['query' => $query, 'source' => 'archive', 'videos' => array_slice($videos, 0, $limit)]);
+
+        // Archive.org lists files that are not downloadable (HTTP 403). Only
+        // hand candidates to the AI whose bytes we could actually range-read,
+        // otherwise a job dies after the agent has already picked them.
+        $probe = [];
+        foreach ($videos as $v) {
+            if (isset($metas[$v['id']])) $probe[$v['id']] = archive_file_url($metas[$v['id']], $v['file']);
+        }
+        $ok = archive_probe_urls($probe, 8);
+        $checked = count(array_filter($ok));
+        $videos = array_values(array_filter($videos, fn($v) => !empty($ok[$probe[$v['id']] ?? ''])));
+        json_out([
+            'query' => $query, 'source' => 'archive',
+            'videos' => array_slice($videos, 0, $limit),
+            'checked' => $checked, 'downloadable' => count($videos),
+        ]);
     } catch (Throwable $e) {
         fail('Archive.org search failed: ' . $e->getMessage(), 502);
     }

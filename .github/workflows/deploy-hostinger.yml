@@ -51,14 +51,58 @@ jobs:
           HOSTINGER_API_TOKEN: ${{ secrets.HOSTINGER_API_TOKEN }}
         run: bash scripts/deploy-hostinger.sh "$RUNNER_TEMP"/.deploy-*.zip
 
+      # Smoke tests run from GitHub's network (Hostinger rate-limits the
+      # deployer's own IP) and exercise the real pipeline: source search →
+      # stream resolution → byte relay. The AI check only warns, so NVIDIA
+      # flakiness never blocks a deploy.
       - name: Verify live site
         run: |
+          fail() { echo "::error::$1"; exit 1; }
           for i in $(seq 1 12); do
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
               https://vva.chrif.net/api/categories.php || true)
-            if [ "$code" = "200" ]; then echo "live: HTTP 200"; exit 0; fi
-            echo "attempt $i: HTTP ${code:-none}"
-            sleep 10
+            [ "$code" = "200" ] && break
+            echo "attempt $i: HTTP ${code:-none}"; sleep 10
           done
-          echo "::error::vva.chrif.net did not answer HTTP 200"
-          exit 1
+          [ "$code" = "200" ] || fail "vva.chrif.net did not answer HTTP 200"
+
+          post() { curl -s --max-time 90 -X POST "$1" -H 'Content-Type: application/json' --data "$2"; }
+
+          echo "→ archive source search"
+          search=$(post https://vva.chrif.net/api/search.php '{"query":"funny dog","limit":3,"source":"archive"}') \
+            || fail "archive search request failed"
+          out=$search
+          n=$(jq '.videos | length' <<<"$out" 2>/dev/null || echo 0)
+          [ "${n:-0}" -gt 0 ] || fail "archive search returned no videos: $(head -c 200 <<<"$out")"
+          id=$(jq -r '.videos[0].id' <<<"$out")
+          echo "  $n candidates, first: $id"
+
+          echo "→ stream resolution"
+          out=$(post https://vva.chrif.net/api/player.php "{\"id\":\"$id\",\"provider\":\"archive\"}") \
+            || fail "player request failed"
+          url=$(jq -r '.streams[0].url // empty' <<<"$out")
+          case "$url" in https://*) ;; *) fail "no https stream url: $(head -c 200 <<<"$out")";; esac
+          echo "  stream: $(head -c 90 <<<"$url")…"
+
+          echo "→ byte relay (range.php)"
+          enc=$(printf '%s' "$url" | basenc --base64url | tr -d '=')
+          code=$(curl -s -o /tmp/chunk.bin -D /tmp/chunk.h -w '%{http_code}' --max-time 60 \
+            -H 'Range: bytes=0-65535' "https://vva.chrif.net/api/range.php?u=$enc" || true)
+          [ "$code" = "206" ] || fail "range relay returned $code"
+          grep -qi '^content-range: bytes 0-65535/' /tmp/chunk.h || fail "missing Content-Range"
+          head -c 12 /tmp/chunk.bin | grep -q ftyp || fail "first bytes are not an mp4"
+          echo "  206 + Content-Range + ftyp ✓"
+
+          echo "→ thumbnails (proxied covers)"
+          thumb=$(jq -r '.videos[0].thumb' <<<"$search")
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+            "https://vva.chrif.net/api/thumb.php?provider=archive&url=$(printf '%s' "$thumb" | jq -sRr @uri)" || true)
+          [ "$code" = "200" ] || echo "::warning::thumb proxy returned $code"
+
+          echo "→ AI endpoint (non-blocking)"
+          code=$(curl -s -o /tmp/ai.json -w '%{http_code}' --max-time 120 -X POST \
+            https://vva.chrif.net/api/ai.php -H 'Content-Type: application/json' \
+            --data '{"system":"Reply with only JSON.","user":"Return {\"ok\":true}","maxTokens":20}' || true)
+          if [ "$code" = "200" ]; then echo "  ai: $(jq -r .model /tmp/ai.json)"; else echo "::warning::ai.php returned $code"; fi
+
+          echo "all smoke tests passed"

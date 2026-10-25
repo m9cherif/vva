@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ViralClips AI — pick a category, let AI watch and cut the highlights</title>
+  <meta name="description" content="Choose a video category. AI vision models watch real videos frame by frame, rank the viral moments, and cut as many high-impact clips as you want." />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>" />
+</head>
+<body>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">▶</span>
+      <div>
+        <h1>ViralClips <span class="accent">AI</span></h1>
+        <p>Pick a category → AI watches the videos → you get the highlighted clips</p>
+      </div>
+    </div>
+    <div class="engine" id="engineBadge" title="Vision model used for frame analysis">vision engine · idle</div>
+  </header>
+
+  <main>
+    <!-- ───────────── 1. CONTROLS ───────────── -->
+    <section class="panel controls">
+      <div class="step-title"><span class="step-num">1</span> Choose a video category</div>
+      <div class="chips" id="chips" role="group" aria-label="Categories"></div>
+
+      <div class="custom-row">
+        <input id="customCategory" type="text" maxlength="80"
+               placeholder="…or type any niche you want (e.g. ice fishing, drone racing)" />
+      </div>
+
+      <div class="step-title"><span class="step-num">2</span> Tune the output</div>
+      <div class="sliders">
+        <label class="slider">
+          <span class="slider-head"><b>Number of clips</b><output id="clipCountOut">3</output></span>
+          <input id="clipCount" type="range" min="1" max="12" value="3" />
+          <span class="slider-ends"><i>1</i><i>12</i></span>
+        </label>
+
+        <label class="slider">
+          <span class="slider-head"><b>Clip length</b><output id="clipLengthOut">20s</output></span>
+          <input id="clipLength" type="range" min="8" max="60" step="2" value="20" />
+          <span class="slider-ends"><i>8s</i><i>60s</i></span>
+        </label>
+
+        <label class="slider">
+          <span class="slider-head"><b>Source videos</b><output id="sourceCountOut">4</output></span>
+          <input id="sourceCount" type="range" min="2" max="6" value="4" />
+          <span class="slider-ends"><i>2</i><i>6</i></span>
+        </label>
+
+        <div class="select-row">
+          <label class="sel">
+            <span>Format</span>
+            <select id="aspect">
+              <option value="16:9">16:9 Landscape</option>
+              <option value="9:16">9:16 Vertical · Reels/TikTok</option>
+              <option value="1:1">1:1 Square</option>
+            </select>
+          </label>
+          <label class="sel">
+            <span>Quality</span>
+            <select id="quality">
+              <option value="720">720p · best</option>
+              <option value="480">480p · fastest</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <label class="slider">
+          <span class="slider-head"><b>Footage analysed per video</b><output id="windowSecondsOut">150s</output></span>
+          <input id="windowSeconds" type="range" min="60" max="240" step="30" value="150" />
+          <span class="slider-ends"><i>60s</i><i>240s</i></span>
+        </label>
+        <p class="hint">The vision model samples a frame every 6 seconds across this window of each source video.</p>
+      </details>
+
+      <button id="generate" class="cta">
+        <span class="cta-label">Generate viral clips</span>
+        <span class="cta-sub">searches · downloads · watches · cuts</span>
+      </button>
+      <p class="micro" id="estimate">≈ 5–10 minutes per run · runs in your browser, only the footage it needs is downloaded</p>
+    </section>
+
+    <section class="panel history" id="history" hidden>
+      <div class="history-head">
+        <h2>Recent runs</h2>
+        <span class="micro">saved on the server — click a run to reopen its clips</span>
+      </div>
+      <div class="history-list" id="historyList"></div>
+    </section>
+
+    <!-- ───────────── 2. PIPELINE ───────────── -->
+    <section class="panel pipeline" id="pipeline" hidden>
+      <div class="step-title"><span class="step-num">3</span> AI is working</div>
+
+      <div class="stepper" id="stepper">
+        <div class="step" data-stage="searching"><span>1</span>AI research</div>
+        <div class="step" data-stage="downloading"><span>2</span>Download</div>
+        <div class="step" data-stage="watching"><span>3</span>AI watching</div>
+        <div class="step" data-stage="selecting"><span>4</span>Highlights</div>
+        <div class="step" data-stage="cutting"><span>5</span>Cut clips</div>
+        <div class="step" data-stage="done"><span>6</span>Ready</div>
+      </div>
+
+      <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+      <div class="stage-line"><span id="stageMsg">Starting…</span><b id="percentLabel">0%</b></div>
+
+      <div class="sources" id="sources"></div>
+
+      <div class="console" id="console" aria-live="polite"><div class="console-line dim">Waiting for the pipeline…</div></div>
+    </section>
+
+    <!-- ───────────── 3. RESULTS ───────────── -->
+    <section class="panel results" id="results" hidden>
+      <div class="results-head">
+        <div class="step-title"><span class="step-num">4</span> Your clips</div>
+        <div class="results-meta" id="resultsMeta"></div>
+      </div>
+      <div class="grid" id="clipGrid"></div>
+      <div class="results-actions">
+        <button class="ghost" id="againBtn">Run another category</button>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <footer>
+    <p>Highlights are chosen by a vision language model scoring every sampled frame for viral potential.
+       Clips are cut in your browser with ffmpeg.wasm — the server only relays short requests.</p>
+  </footer>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

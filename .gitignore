@@ -1,0 +1,14 @@
+.env
+node_modules/
+workspace/
+*.log
+__pycache__/
+
+bin/
+webhosting/public_html/data/*.json
+webhosting/public_html/data/*.log
+*.mp4
+!webhosting/public_html/data/.htaccess
+
+webhosting/public_html/data/cache/
+webhosting/public_html/data/jobs/

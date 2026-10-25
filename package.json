@@ -1,0 +1,13 @@
+{
+  "name": "viral-clips-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AI viral clip finder: search a category, let a vision AI watch the videos, cut the highlighted moments into clips.",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

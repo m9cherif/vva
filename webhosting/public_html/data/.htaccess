@@ -1,0 +1,3 @@
+# Job state lives here; never reachable over HTTP (root .htaccess rewrites
+# /data/ to 404, this is a second line of defense).
+Require all denied

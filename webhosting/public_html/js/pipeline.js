@@ -1,0 +1,243 @@
+/* The pipeline — browser-orchestrated port of server/lib/pipeline.js.
+ * Same stages, same events, same prompts; the heavy lifting (download, frame
+ * sampling, ffmpeg cutting) happens in the visitor's browser so shared
+ * hosting only ever sees short PHP requests. */
+import { api } from './api.js';
+import { researchSources } from './agent.js';
+import { downloadPrefix } from './downloader.js';
+import { extractFrames, scoreFrames, generateCopy, cutClip, ffmpeg } from './media.js';
+
+const interval = 6;
+const mapPool = async (items, n, worker) => {
+  const res = new Array(items.length);
+  let cur = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (cur < items.length) { const i = cur++; res[i] = await worker(items[i], i); }
+  }));
+  return res;
+};
+
+const fmtViews = (n) => { const v = Number(n) || 0;
+  if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B`; if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`; return String(v); };
+
+export function newJobId() {
+  return (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : Date.now().toString(36) + Math.random().toString(36).slice(2, 12));
+}
+
+export async function runJob(params, emit) {
+  const { category, clipCount, clipLength, sourceCount, windowSeconds, quality, aspect } = params;
+  const job = {
+    id: newJobId(), params, category, status: 'running', createdAt: Date.now(), finishedAt: null,
+    stage: 'searching', percent: 0, logs: [], sources: [], clips: [], model: null, error: null,
+  };
+  const stage = (s, pct, msg) => { job.stage = s; job.percent = pct; emit({ type: 'stage', stage: s, percent: pct, message: msg }); };
+  const log = (text) => { job.logs.push(text); emit({ type: 'log', text }); };
+  const save = () => { api.saveJob(job).catch(() => {}); };
+  const srcEvent = (entry) => emit({ type: 'source', source: entry });
+
+  try {
+    // warm up ffmpeg in the background while the agent researches
+    ffmpeg().catch(() => {});
+
+    /* 1 ─ AI research */
+    stage('searching', 4, `AI agent is researching ${category} videos`);
+    let turn = 0;
+    const { videos: sources } = await researchSources({
+      category, need: sourceCount, minDuration: clipLength + 10,
+      log: (text) => { turn++; log(text); stage('searching', Math.min(9, 4 + turn * 0.35), 'AI agent researching sources'); },
+    });
+    if (!sources.length) throw new Error(`No downloadable videos found for "${category}". Try another category.`);
+    sources.forEach((v, i) => {
+      job.sources.push({ id: v.id, title: v.title, channel: v.channel, views: v.views, duration: v.duration,
+        url: `https://www.youtube.com/watch?v=${v.id}`, thumb: api.thumb(v.id), status: 'queued', percent: 0, peakScore: null, avgScore: null });
+      log(`#${i + 1} ${v.title} — ${fmtViews(v.views)} views`);
+    });
+    save();
+
+    /* 2 ─ Stream resolution + window download */
+    stage('downloading', 10, `Resolving streams for ${sources.length} videos`);
+    const prepared = [];
+    await mapPool(job.sources, 2, async (entry, idx) => {
+      try {
+        const info = await api.player(entry.id);
+        entry.duration = info.duration || entry.duration;
+        const videos = info.streams.filter((s) => s.kind === 'video' && s.height > 0 && s.mimeType.includes('mp4'));
+        const best = videos.filter((s) => s.height <= quality).sort((a, b) => b.height - a.height)[0]
+                   || videos.sort((a, b) => a.height - b.height)[0];
+        if (!best) throw new Error('no compatible video stream');
+        const window = Math.min(windowSeconds, entry.duration || windowSeconds);
+        entry.status = 'downloading'; srcEvent(entry);
+        const dl = await downloadPrefix({ ...best, durationSec: info.duration }, window, (pct) => {
+          if (pct === entry.percent) return;
+          entry.percent = pct; srcEvent(entry);
+        });
+        const got = dl.blob;
+        entry.status = 'downloaded'; entry.percent = 100; entry.localDuration = dl.coveredSec; srcEvent(entry);
+        log(`Ready "${entry.title}" — ${dl.coveredSec}s window, ${(got.size / 1048576).toFixed(1)} MB at ${best.height}p`);
+        prepared.push({ video: entry, blob: got, duration: dl.coveredSec, height: best.height, index: idx, base: info });
+      } catch (err) {
+        entry.status = 'failed'; srcEvent(entry);
+        log(`Skipped "${entry.title}" — ${String(err.message || err).slice(0, 160)}`);
+      }
+    });
+    if (!prepared.length) throw new Error('All source downloads failed — YouTube may be rate-limiting. Retry in a minute.');
+    log(`${prepared.length}/${job.sources.length} videos ready for analysis`);
+    stage('downloading', 32, 'Sampling frames from every video');
+
+    /* 3 ─ Frames */
+    const analyze = [];
+    for (const item of prepared) {
+      try {
+        const { frames, duration } = await extractFrames(item.blob, { intervalSec: interval, limitSec: item.duration });
+        item.frames = frames; item.duration = Math.min(item.duration, duration); analyze.push(item);
+        log(`Sampled ${frames.length} frames from "${item.video.title}" (every ${interval}s)`);
+      } catch (err) {
+        item.video.status = 'failed'; srcEvent(item.video);
+        log(`Frame sampling failed for "${item.video.title}" — ${String(err.message || err).slice(0, 140)}`);
+      }
+    }
+    if (!analyze.length) throw new Error('Could not sample frames from any source video.');
+
+    /* 4 ─ Vision */
+    stage('watching', 42, 'AI vision model is watching every frame');
+    const totalFrames = analyze.reduce((n, a) => n + a.frames.length, 0);
+    let doneFrames = 0;
+    await mapPool(analyze, 2, async (item) => {
+      try {
+        const { scores, model } = await scoreFrames(item.frames, {
+          interval, videoTitle: item.video.title,
+          onBatch: (b) => {
+            if (b.model && !job.model) { job.model = b.model; log(`Vision model in use: ${b.model}`); }
+            doneFrames += b.done;
+            stage('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${doneFrames}/${totalFrames})`);
+          },
+        });
+        item.scores = scores;
+        item.best = scores.reduce((m, s) => Math.max(m, s.score), 0);
+        item.avg = Math.round(scores.reduce((n, s) => n + s.score, 0) / scores.length);
+        log(`"${item.video.title}" — peak virality ${item.best}/100, average ${item.avg}/100`);
+        Object.assign(job.sources[item.index], { status: 'watched', peakScore: item.best, avgScore: item.avg });
+        srcEvent(job.sources[item.index]);
+      } catch (err) {
+        item.failed = true;
+        log(`Analysis failed for "${item.video.title}" — ${String(err.message || err).slice(0, 200)}`);
+      }
+    });
+    const analyzed = analyze.filter((a) => !a.failed && a.scores && a.scores.length >= 3);
+    if (!analyzed.length) throw new Error('The AI could not score any source video. Try running again.');
+
+    /* 5 ─ Select highlight windows */
+    stage('selecting', 78, 'Ranking highlight windows across all videos');
+    let segments = selectSegments(analyzed, { clipCount, clipLength, interval });
+    if (!segments.length) throw new Error('No highlight windows found for that clip length — try a shorter clip length.');
+    if (segments.length < clipCount) log(`Only ${segments.length} of ${clipCount} clips available (sources too short)`);
+    log(`Selected ${segments.length} highlight windows (avg score ${Math.round(segments.reduce((n, s) => n + s.score, 0) / segments.length)}/100)`);
+    save();
+
+    /* 6 ─ Cut clips with ffmpeg.wasm */
+    stage('cutting', 84, `Cutting ${segments.length} clips`);
+    const byId = new Map(analyzed.map((a) => [a.video.id, a]));
+    const cut = [];
+    for (let i = 0; i < segments.length; i += 1) {
+      const seg = segments[i];
+      const src = byId.get(seg.videoId);
+      try {
+        stage('cutting', 84 + ((i) / segments.length) * 12, `Cutting clip ${i + 1} of ${segments.length}`);
+        const blob = await cutClip({
+          videoBlob: src.blob, audioBlob: null, startSec: seg.startSec,
+          span: seg.endSec - seg.startSec, aspect,
+          onProgress: (p) => stage('cutting', 84 + ((i + p / 100) / segments.length) * 12, `Encoding clip ${i + 1} (${p}%)`),
+        });
+        const name = `clip_${String(i + 1).padStart(2, '0')}.mp4`;
+        const up = await api.uploadClip(job.id, name, blob);
+        const clip = toClip(job, seg, up.url, i + 1, null);
+        job.clips.push(clip);
+        emit({ type: 'clip-ready', clip });
+        cut.push(seg);
+        log(`Clip ${i + 1} rendered — ${(blob.size / 1048576).toFixed(1)} MB`);
+        save();
+      } catch (err) {
+        log(`Clip ${i + 1} failed to render — ${String(err.message || err).slice(0, 160)}`);
+      }
+    }
+    if (!cut.length) throw new Error('ffmpeg could not render any clips.');
+
+    /* 7 ─ Titles + hooks */
+    stage('cutting', 96, 'Writing titles and hooks');
+    const copy = await generateCopy(cut.map((c) => ({ videoTitle: c.videoTitle, channel: c.channel, startSec: c.startSec, endSec: c.endSec, highlights: c.highlights })));
+    const byIndex = new Map();
+    if (Array.isArray(copy)) for (const c of copy) { const n = Number(c?.index); if (Number.isFinite(n)) byIndex.set(n, c); }
+    job.clips = cut.map((c, i) => toClip(job, c, job.clips[i].file, i + 1, byIndex.get(i + 1) || null));
+
+    /* 8 ─ Finish */
+    job.status = 'done'; job.finishedAt = Date.now();
+    stage('done', 100, `${job.clips.length} clips ready`);
+    log(`Done — ${job.clips.length} clip${job.clips.length === 1 ? '' : 's'} ready to preview`);
+    save();
+    emit({ type: 'result', clips: job.clips, model: job.model, sources: job.sources });
+  } catch (err) {
+    job.status = 'error'; job.error = String(err?.message || err); job.finishedAt = Date.now();
+    stage('error', job.percent, job.error);
+    log(`ERROR: ${job.error}`);
+    save();
+    emit({ type: 'error', message: job.error });
+  }
+  return job;
+}
+
+/* Port of selectSegments — smoothed sliding-window ranking with per-video caps. */
+function selectSegments(analyzed, { clipCount, clipLength, interval }) {
+  const all = [];
+  for (const item of analyzed) {
+    const scores = item.scores;
+    const maxStart = item.duration || (scores[scores.length - 1].t + interval);
+    const smoothed = scores.map((s, i) => ({ ...s,
+      v: 0.5 * s.score + 0.3 * (scores[i - 1]?.score ?? s.score) + 0.2 * (scores[i + 1]?.score ?? s.score) }));
+    for (const head of smoothed) {
+      const start = Math.max(0, head.t);
+      const end = start + clipLength;
+      if (end > maxStart) continue;
+      const inside = smoothed.filter((s) => s.t >= start && s.t < end);
+      if (!inside.length) continue;
+      const score = Math.round(inside.reduce((n, s) => n + s.v, 0) / inside.length);
+      const highlights = [...inside].sort((a, b) => b.score - a.score).slice(0, 3).map((s) => s.desc).filter(Boolean);
+      all.push({ videoId: item.video.id, videoTitle: item.video.title, channel: item.video.channel,
+        views: item.video.views, videoUrl: item.video.url, startSec: start, endSec: end, score, highlights, index: item.index });
+    }
+  }
+  all.sort((a, b) => b.score - a.score);
+  const caps = [1, 2, 3, Infinity];
+  let best = [];
+  for (const cap of caps) {
+    const chosen = [];
+    const perVideo = new Map();
+    for (const cand of all) {
+      if (chosen.length >= clipCount) break;
+      const n = perVideo.get(cand.videoId) || 0;
+      if (n >= cap) continue;
+      if (chosen.some((c) => c.videoId === cand.videoId && Math.abs(c.startSec - cand.startSec) < clipLength * 0.75)) continue;
+      perVideo.set(cand.videoId, n + 1);
+      chosen.push(cand);
+    }
+    best = chosen;
+    if (chosen.length >= clipCount) break;
+  }
+  return best.sort((a, b) => a.startSec - b.startSec);
+}
+
+function toClip(job, segment, file, index, copy) {
+  const hashtags = (Array.isArray(copy?.hashtags) ? copy.hashtags.filter((h) => typeof h === 'string' && h.trim()).slice(0, 7).map((h) => (h.startsWith('#') ? h : `#${h}`)) : []);
+  const base = segment.videoTitle.replace(/\s*[-|–]\s*YouTube$/i, '').slice(0, 50);
+  const round1 = (n) => Math.round(n * 10) / 10;
+  return {
+    id: `${job.id}-${index}`, index,
+    title: copy?.title || `${base} — ${clock(segment.startSec)} highlight`,
+    hook: copy?.hook || segment.highlights?.[0] || `Highlight from ${segment.videoTitle}`,
+    caption: copy?.caption || copy?.hook || '', hashtags,
+    score: segment.score, aspect: job.params.aspect,
+    startSec: round1(segment.startSec), endSec: round1(segment.endSec), duration: round1(segment.endSec - segment.startSec),
+    videoTitle: segment.videoTitle, channel: segment.channel, views: segment.views, sourceUrl: segment.videoUrl, file,
+  };
+}
+const clock = (sec) => { const s = Math.max(0, Math.round(sec)); return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };

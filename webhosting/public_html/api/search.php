@@ -35,7 +35,8 @@ if ($source === 'pexels') {
 if ($source === 'archive') {
     try {
         $q = rawurlencode(trim($query) . ' AND mediatype:movies');
-        $rows = min(30, max(6, $limit));
+        $rows = 40;   // metadata is fetched in parallel; a wide pool matters because
+                      // many archive items have no usable mp4 derivative
         $res = http_get_json(
             "https://archive.org/advancedsearch.php?q={$q}&fl%5B%5D=identifier&fl%5B%5D=title"
             . "&fl%5B%5D=downloads&rows={$rows}&output=json",

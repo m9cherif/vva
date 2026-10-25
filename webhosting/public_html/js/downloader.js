@@ -63,7 +63,7 @@ export async function downloadPrefix(stream, windowSec, onProgress = () => {}) {
   }
   if (!total) throw new Error('could not determine stream size');
 
-  // 2. header â€” parse moov/sidx to plan exact bytes
+  // 2. header — parse moov/sidx to plan exact bytes
   const head = await fetchChunk(url, 0, HEADER_BYTES - 1);
   let endByte = total;
   let method = 'full';
@@ -97,7 +97,7 @@ export async function downloadPrefix(stream, windowSec, onProgress = () => {}) {
   }
 
   onProgress(100);
-  // Covered time â‰ˆ duration Ã— (bytes / total) when we had to estimate.
+  // Covered time ≈ duration × (bytes / total) when we had to estimate.
   const coveredSec = boundaryOk || method === 'sidx'
     ? windowSec
     : Math.floor(stream.durationSec * (got / total) * 0.95);

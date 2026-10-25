@@ -1,4 +1,4 @@
-/* ViralClips AI â€” front-end controller (shared-hosting build)
+/* ViralClips AI — front-end controller (shared-hosting build)
  * Same UI as the Node app; the pipeline itself now runs HERE, in the browser,
  * driven by js/pipeline.js. The server only ever sees short PHP requests. */
 import { api } from './api.js?v=build1';
@@ -38,7 +38,7 @@ const state = { category: '', source: 'chip', jobId: null, clips: [], running: f
 
 const STAGES = ['searching', 'downloading', 'watching', 'selecting', 'cutting', 'done'];
 
-/* â”€â”€ boot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* ── boot ────────────────────────────────────────────── */
 init();
 
 async function init() {
@@ -136,10 +136,10 @@ function updateEstimate() {
   const clips = Number(els.clipCount.value);
   const sources = Number(els.sourceCount.value);
   const secs = Math.round(45 + sources * 18 + clips * 9);
-  els.estimate.textContent = `â‰ˆ ${Math.floor(secs / 60)}â€“${Math.ceil(secs / 60) + 2} minutes per run Â· ${sources} videos watched by AI`;
+  els.estimate.textContent = `≈ ${Math.floor(secs / 60)}–${Math.ceil(secs / 60) + 2} minutes per run · ${sources} videos watched by AI`;
 }
 
-/* â”€â”€ run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* ── run ─────────────────────────────────────────────── */
 async function start() {
   if (state.running) return;
   const category = (state.category || els.custom.value).trim();
@@ -151,7 +151,7 @@ async function start() {
 
   state.running = true;
   els.generate.disabled = true;
-  els.generate.querySelector('.cta-label').textContent = 'Pipeline runningâ€¦';
+  els.generate.querySelector('.cta-label').textContent = 'Pipeline running…';
   els.results.hidden = true;
   els.pipeline.hidden = false;
   resetPipelineUI();
@@ -214,7 +214,7 @@ function finishRun(ok) {
   loadHistory();
 }
 
-/* â”€â”€ history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* ── history ─────────────────────────────────────────── */
 async function loadHistory() {
   try {
     const { jobs } = await api.jobs();
@@ -241,7 +241,7 @@ function historyRow(j) {
     <span class="hist-go"></span>`;
   row.querySelector('.hist-cat').textContent = j.category;
   row.querySelector('.hist-meta').textContent = j.clipCount
-    ? `${j.clipCount} clip${j.clipCount === 1 ? '' : 's'} Â· ${j.clipLength}s Â· ${j.aspect}${j.quality ? ` Â· ${j.quality}p` : ''}`
+    ? `${j.clipCount} clip${j.clipCount === 1 ? '' : 's'} · ${j.clipLength}s · ${j.aspect}${j.quality ? ` · ${j.quality}p` : ''}`
     : `${j.status}`;
   row.querySelector('.hist-when').textContent = when;
   row.querySelector('.hist-go').textContent = j.clipCount ? 'Open' : 'Details';
@@ -264,17 +264,17 @@ async function openRun(id) {
   }
 }
 
-/* â”€â”€ UI updates â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* ── UI updates ──────────────────────────────────────── */
 function resetPipelineUI() {
   state.lastStage = null;
-  els.console.innerHTML = '<div class="console-line dim">Booting pipelineâ€¦</div>';
+  els.console.innerHTML = '<div class="console-line dim">Booting pipeline…</div>';
   els.sources.innerHTML = '';
   els.clipGrid.innerHTML = '';
   state.clips = [];
   els.barFill.style.width = '0%';
   els.percentLabel.textContent = '0%';
-  els.stageMsg.textContent = 'Startingâ€¦';
-  els.engine.textContent = 'vision engine Â· starting';
+  els.stageMsg.textContent = 'Starting…';
+  els.engine.textContent = 'vision engine · starting';
   els.engine.classList.remove('live');
   document.querySelectorAll('.step').forEach((s) => s.classList.remove('active', 'done', 'error'));
 }
@@ -371,7 +371,7 @@ function renderResults(ev) {
   els.clipGrid.innerHTML = '';
   state.clips.forEach((c) => els.clipGrid.appendChild(buildCard(c, true)));
   els.results.hidden = state.clips.length === 0;
-  els.resultsMeta.textContent = `${state.clips.length} clips Â· scored by ${ev.model || 'vision model'} Â· ${ev.sources?.length || 0} videos watched`;
+  els.resultsMeta.textContent = `${state.clips.length} clips · scored by ${ev.model || 'vision model'} · ${ev.sources?.length || 0} videos watched`;
   els.results.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -386,14 +386,14 @@ function buildCard(clip, animate) {
     <div class="card-body">
       <div class="card-top">
         <h3></h3>
-        <span class="score ${scoreClass}">${Math.round(clip.score)} ðŸ”¥</span>
+        <span class="score ${scoreClass}">${Math.round(clip.score)} 🔥</span>
       </div>
       <p class="hook"></p>
       <div class="tags" hidden></div>
       <div class="caption" hidden><button class="copy-btn" type="button">Copy</button><span class="caption-text"></span></div>
       <div class="card-meta">
         <span class="range"></span>
-        <a class="src-link" target="_blank" rel="noopener">Watch source â†—</a>
+        <a class="src-link" target="_blank" rel="noopener">Watch source ↗</a>
       </div>
       <div class="card-meta" style="border-top:0;padding-top:8px">
         <span class="who"></span>
@@ -429,17 +429,17 @@ function buildCard(clip, animate) {
       setTimeout(() => { e.target.textContent = 'Copy'; }, 1800);
     });
   }
-  card.querySelector('.range').textContent = `${fmt(clip.startSec)} â†’ ${fmt(clip.endSec)} Â· ${clip.duration}s`;
+  card.querySelector('.range').textContent = `${fmt(clip.startSec)} → ${fmt(clip.endSec)} · ${clip.duration}s`;
   const link = card.querySelector('.src-link');
   link.href = clip.sourceUrl;
-  card.querySelector('.who').textContent = `${clip.channel} Â· ${formatViews(clip.views)} views`;
+  card.querySelector('.who').textContent = `${clip.channel} · ${formatViews(clip.views)} views`;
   const dl = card.querySelector('.dl');
   dl.href = clip.file;
   dl.download = `${clip.title.replace(/[^\w\s-]/g, '').trim().slice(0, 60) || 'clip'}.mp4`;
   return card;
 }
 
-/* â”€â”€ utils â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* ── utils ───────────────────────────────────────────── */
 function toast(message, kind) {
   els.toast.textContent = message;
   els.toast.className = `toast${kind ? ` ${kind}` : ''}`;

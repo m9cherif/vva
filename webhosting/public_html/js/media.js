@@ -62,7 +62,7 @@ export async function scoreFrames(frames, { interval, videoTitle, batch = 10, on
     const group = frames.slice(i, i + batch);
     const times = group.map((f) => f.t).join(', ');
     const user=`Video: "${videoTitle}".\nThe ${group.length} attached frames are sampled every ${interval} seconds in this order, captured at t = ${times} seconds.\n\nReturn ONLY a JSON array with exactly ${group.length} objects, one per frame, in the same order:\n[{"t": <seconds>, "desc": "<what is happening, max 10 words>", "score": <integer 0-100>}]`;
-    const { text, model } = await api.ai({ system: SCORING_SYSTEM, user, images: group.map((f) => f.b64), maxTokens: 4000, temperature: 0.2 });
+    const { text, model } = await api.ai({ system: SCORING_SYSTEM, user, images: group.map((f) => f.b64), maxTokens: 4000, temperature: 0.2, timeoutSec: 110 });
     usedModel = model;
     const parsed = extractJson(text);
     if (!Array.isArray(parsed)) throw new Error(`model returned unparseable frame scores (${model})`);

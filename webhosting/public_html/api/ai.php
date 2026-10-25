@@ -33,7 +33,12 @@ foreach ((array) ($in['history'] ?? []) as $m) {
 $maxTokens = max(16, min(8000, (int) ($in['maxTokens'] ?? 1600)));
 $temperature = max(0.0, min(2.0, (float) ($in['temperature'] ?? 0.2)));
 $attempts = max(1, min(3, (int) ($in['attempts'] ?? 2)));
-$timeout = min(limits()['aiTimeoutSec'], max(30, (int) ($in['timeoutSec'] ?? 120)));
+$timeout = min(limits()['aiTimeoutSec'], max(30, (int) ($in['timeoutSec'] ?? 70)));
+/* Hard deadline: the browser aborts at 200s and PHP dies at 170s, so the
+ * model chain must always answer in time — with a failure report if nothing
+ * worked, never by hanging. */
+$deadline = microtime(true) + min(150, limits()['aiTimeoutSec'] - 10);
+$remaining = fn(): int => (int) floor($deadline - microtime(true));
 
 /** One call to one model. Returns [ok, text|error, meta]. */
 function call_model(string $model, array $messages, int $maxTokens, float $temperature, int $timeout): array {
@@ -81,13 +86,14 @@ $messages[] = ['role' => 'user', 'content' => $user];
 
 for ($round = 0; $round < $attempts; $round++) {
     foreach ($cfg['visionModels'] as $model) {
-        [$ok, $text, $meta] = call_model($model, $messages, $maxTokens, $temperature, $timeout);
-        // Transient trouble on this model (5xx / empty reply) — retry it once before falling through.
+        $left = $remaining();
+        if ($left < 10) break 2;
+        [$ok, $text, $meta] = call_model($model, $messages, $maxTokens, $temperature, min($timeout, $left));
         // Transient trouble on this model (5xx / empty reply) — retry it once before falling through.
         $tries = 0;
-        while ($tries < 2 && !$ok && (!empty($meta['serverError']) || !empty($meta['empty']))) {
+        while ($tries < 2 && !$ok && $remaining() > 25 && (!empty($meta['serverError']) || !empty($meta['empty']))) {
             $warnings[] = $model . ' ' . (!empty($meta['serverError']) ? 'server error' : 'empty reply') . ' — retrying';
-            [$ok, $text, $meta] = call_model($model, $messages, $maxTokens, $temperature, $timeout);
+            [$ok, $text, $meta] = call_model($model, $messages, $maxTokens, $temperature, min($timeout, $remaining()));
             $tries++;
         }
         if ($ok) {
@@ -95,8 +101,9 @@ for ($round = 0; $round < $attempts; $round++) {
         }
         $failures[] = "{$model} -> {$text}";
         $warnings[] = "{$model} failed: {$text}";
-        if (!empty($meta['rateLimit'])) sleep(6 * ($round + 1));
+        if (!empty($meta['rateLimit']) && $remaining() > 15) sleep(min(6 * ($round + 1), $remaining() - 10));
     }
+    if ($remaining() < 10) break;
     sleep(1);
 }
 

@@ -1,0 +1,61 @@
+name: Deploy to Hostinger
+
+# Push to main → package webhosting/public_html → upload to vva.chrif.net →
+# extract → verify. Nothing long-running ever runs on the server: this is the
+# same upload + extract sequence the site was first deployed with.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vva-chrif-net
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Package & deploy public_html
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # .env is never stored in git — CI regenerates it from secrets.
+      - name: Recreate .env
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          if [ -z "$NVIDIA_API_KEY" ]; then
+            echo "::error::Secret NVIDIA_API_KEY is not set on the repository"
+            exit 1
+          fi
+          {
+            echo "NVIDIA_API_KEY=$NVIDIA_API_KEY"
+            echo "NVIDIA_API_BASE=https://integrate.api.nvidia.com/v1"
+          } > webhosting/public_html/.env
+
+      # Dot-prefixed name: .htaccess denies every dotfile, so the archive can
+      # never be downloaded even while it sits in public_html.
+      - name: Package public_html
+        run: |
+          cd webhosting/public_html
+          zip -qr "$RUNNER_TEMP/.deploy-$(date -u +%Y%m%d_%H%M%S).zip" .
+          ls -la "$RUNNER_TEMP"/.deploy-*.zip
+
+      - name: Upload & extract on Hostinger
+        env:
+          HOSTINGER_API_TOKEN: ${{ secrets.HOSTINGER_API_TOKEN }}
+        run: bash scripts/deploy-hostinger.sh "$RUNNER_TEMP"/.deploy-*.zip
+
+      - name: Verify live site
+        run: |
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+              https://vva.chrif.net/api/categories.php || true)
+            if [ "$code" = "200" ]; then echo "live: HTTP 200"; exit 0; fi
+            echo "attempt $i: HTTP ${code:-none}"
+            sleep 10
+          done
+          echo "::error::vva.chrif.net did not answer HTTP 200"
+          exit 1

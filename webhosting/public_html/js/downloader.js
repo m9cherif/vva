@@ -4,8 +4,8 @@
  * pieces: every request is short (shared hosting kills long ones), has an
  * abort timeout, and retries with backoff. Returns one Blob.
  */
-import { api, b64url } from './api.js';
-import { planPrefix } from './mp4.js';
+import { api, b64url } from './api.js?v=build1';
+import { planPrefix } from './mp4.js?v=build1';
 
 const HEADER_BYTES = 262_144;          // 256 KB is plenty for ftyp+moov+sidx
 const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request
@@ -63,7 +63,7 @@ export async function downloadPrefix(stream, windowSec, onProgress = () => {}) {
   }
   if (!total) throw new Error('could not determine stream size');
 
-  // 2. header — parse moov/sidx to plan exact bytes
+  // 2. header â€” parse moov/sidx to plan exact bytes
   const head = await fetchChunk(url, 0, HEADER_BYTES - 1);
   let endByte = total;
   let method = 'full';
@@ -97,7 +97,7 @@ export async function downloadPrefix(stream, windowSec, onProgress = () => {}) {
   }
 
   onProgress(100);
-  // Covered time ≈ duration × (bytes / total) when we had to estimate.
+  // Covered time â‰ˆ duration Ã— (bytes / total) when we had to estimate.
   const coveredSec = boundaryOk || method === 'sidx'
     ? windowSec
     : Math.floor(stream.durationSec * (got / total) * 0.95);

@@ -1,8 +1,8 @@
 /* Browser media engine: frame sampling via <video>+canvas, and clip cutting
- * via ffmpeg.wasm (multithreaded core — the COOP/COEP headers enable it). */
-import { api, extractJson } from './api.js';
+ * via ffmpeg.wasm (multithreaded core â€” the COOP/COEP headers enable it). */
+import { api, extractJson } from './api.js?v=build1';
 
-/* ── frames ─────────────────────────────────────────────────────────────── */
+/* â”€â”€ frames â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 export async function extractFrames(blob, { intervalSec = 6, width = 384, limitSec = 0, onProgress = () => {} } = {}) {
   const url = URL.createObjectURL(blob);
   const video = document.createElement('video');
@@ -49,7 +49,7 @@ function seek(video, t) {
   });
 }
 
-/* ── vision scoring ─────────────────────────────────────────────────────── */
+/* â”€â”€ vision scoring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const SCORING_SYSTEM=`You are a senior short-form video editor and virality analyst.
 You are shown consecutive frames sampled from a single video, in chronological order.
 Judge each frame on its viral potential as a standalone social clip: genuine emotion and reactions, spectacle or skill, surprise and tension, humor, strong faces, visual clarity, and a payoff. Blurry, static, logo-only, dead-air or uneventful frames must score low. Use the whole 0-100 range.
@@ -77,7 +77,7 @@ export async function scoreFrames(frames, { interval, videoTitle, batch = 10, on
   return { scores: out, model: usedModel };
 }
 
-/* ── copywriting ────────────────────────────────────────────────────────── */
+/* â”€â”€ copywriting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 export async function generateCopy(segments) {
   const user=`Here are ${segments.length} video segments chosen for their viral potential.\n\n${segments.map((s,i)=>`${i+1}. Source video: "${s.videoTitle}" (channel: ${s.channel}). Clip runs ${clock(s.startSec)}-${clock(s.endSec)}. Observed moments: ${(s.highlights||[]).filter(Boolean).join('; ')||'action beats'}`).join('\n')}\n\nReturn ONLY a JSON array of ${segments.length} objects in the same order:\n[{"index":1,"title":"<max 60 chars>","hook":"<max 120 chars>","caption":"<2 sentence caption>","hashtags":["#one","#two"]}, ...]`;
   try {
@@ -87,7 +87,7 @@ export async function generateCopy(segments) {
   } catch { return null; }
 }
 
-/* ── ffmpeg.wasm ────────────────────────────────────────────────────────── */
+/* â”€â”€ ffmpeg.wasm â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 let ffPromise = null;
 export function ffmpeg() {
   if (!ffPromise) ffPromise = (async () => {

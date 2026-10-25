@@ -27,10 +27,15 @@
 </IfModule>
 
 # ── static asset caching ──────────────────────────────────────────────────
+# JS/CSS/HTML are revalidated on every load: a deploy must never leave a
+# visitor running week-old application code (a fresh 304 costs one round-trip).
+<IfModule mod_headers.c>
+  <FilesMatch "\.(js|mjs|css|html)$">
+    Header set Cache-Control "no-cache, must-revalidate"
+  </FilesMatch>
+</IfModule>
 <IfModule mod_expires.c>
   ExpiresActive On
-  ExpiresByType text/css "access plus 1 week"
-  ExpiresByType application/javascript "access plus 1 week"
   ExpiresByType wasm/wasm "access plus 1 week"
   ExpiresByType image/svg+xml "access plus 1 week"
 </IfModule>

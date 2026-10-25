@@ -53,7 +53,9 @@ export const api = {
    * Accepts an id string or a full video object ({id, provider, thumb}). */
   thumb: (video) => {
     const v = typeof video === 'string' ? { id: video } : (video || {});
-    if (v.provider === 'pexels') return `/api/thumb.php?provider=pexels&url=${encodeURIComponent(v.thumb || '')}`;
+    if (v.provider === 'pexels' || v.provider === 'archive') {
+      return `/api/thumb.php?provider=${encodeURIComponent(v.provider)}&url=${encodeURIComponent(v.thumb || '')}`;
+    }
     return `/api/thumb.php?id=${encodeURIComponent(v.id || '')}`;
   },
 

@@ -31,7 +31,37 @@ if ($source === 'pexels') {
         fail('Pexels search failed: ' . $e->getMessage(), 502);
     }
 }
-if ($source !== 'youtube') fail("unknown source \"{$source}\" (use youtube or pexels)");
+/* ── Internet Archive: keyless search + faststart MP4 files ─────────────── */
+if ($source === 'archive') {
+    try {
+        $q = rawurlencode(trim($query) . ' AND mediatype:movies');
+        $rows = min(30, max(6, $limit));
+        $res = http_get_json(
+            "https://archive.org/advancedsearch.php?q={$q}&fl%5B%5D=identifier&fl%5B%5D=title"
+            . "&fl%5B%5D=downloads&rows={$rows}&output=json",
+            [], 30
+        );
+        if ($res['status'] !== 200) fail("Archive.org search returned HTTP {$res['status']}", 502);
+        $data = json_decode($res['body'], true);
+        $docs = $data['response']['docs'] ?? [];
+        if (!is_array($docs) || !$docs) json_out(['query' => $query, 'source' => 'archive', 'videos' => []]);
+
+        $metas = archive_metadata_bulk(array_map(fn($d) => (string) ($d['identifier'] ?? ''), $docs));
+        $videos = [];
+        foreach ($docs as $doc) {
+            $id = (string) ($doc['identifier'] ?? '');
+            if ($id === '' || !isset($metas[$id])) continue;
+            $n = archive_normalize($metas[$id], is_array($doc) ? $doc : [], $query);
+            if ($n) $videos[] = $n;
+        }
+        usort($videos, fn($a, $b) => $b['views'] <=> $a['views']);
+        json_out(['query' => $query, 'source' => 'archive', 'videos' => array_slice($videos, 0, $limit)]);
+    } catch (Throwable $e) {
+        fail('Archive.org search failed: ' . $e->getMessage(), 502);
+    }
+}
+
+if ($source !== 'youtube') fail("unknown source \"{$source}\" (use youtube, pexels or archive)");
 
 try {
     $key = innertube_key();

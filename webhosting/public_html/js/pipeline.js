@@ -41,24 +41,36 @@ export async function runJob(params, emit) {
     ffmpeg().catch(() => {});
 
     /* 0 ─ Choose a source this server can actually pull bytes from.
-     * YouTube is preferred (real viral content); when its player API refuses
-     * this server's IP we fall back to Pexels — direct MP4, free forever. */
+     * Chain: YouTube (real viral content) → Pexels (free key, direct MP4) →
+     * Internet Archive (keyless, free forever, real Range support). Each tier
+     * is probed cheaply so the job never starts on a source that will fail. */
     let source = 'youtube';
-    if (params.source === 'pexels') {
-      source = 'pexels';
-      log('Source: Pexels (chosen explicitly)');
-    } else if (!params.source || params.source === 'auto') {
+    const explicit = params.source && params.source !== 'auto' ? params.source : '';
+    if (explicit) {
+      source = explicit;
+      log(`Source: ${explicit} (chosen explicitly)`);
+    } else {
       stage('searching', 2, 'Checking which video source this server can reach');
       try {
         await api.player('dQw4w9WgXcQ', 'youtube');
+        source = 'youtube';
         log('Source: YouTube — stream downloads work from this server');
       } catch (err) {
         const msg = String(err.message || err);
-        if (/LOGIN_REQUIRED|not playable|\b409\b|bot|captcha/i.test(msg)) {
+        log(`YouTube unavailable for this server (${msg.slice(0, 110)}) — probing fallback sources`);
+        // Pexels only if a key is configured (a missing key answers 400).
+        try {
+          await api.search('nature', 1, 'pexels');
           source = 'pexels';
-          log(`👀 YouTube blocks this server's IP (${msg.slice(0, 90)}) — switching source to Pexels (free, no key stored in git)`);
-        } else {
-          log(`YouTube probe failed (${msg.slice(0, 120)}) — trying YouTube anyway`);
+          log('Source: Pexels — free key configured, direct MP4 files');
+        } catch {
+          try {
+            await api.search('nature', 1, 'archive');
+            source = 'archive';
+            log('Source: Internet Archive — keyless, free forever, direct MP4 files');
+          } catch (err2) {
+            throw new Error(`No usable video source: YouTube blocks this server and the fallbacks failed (${String(err2.message || err2).slice(0, 140)}).`);
+          }
         }
       }
     }
@@ -73,9 +85,10 @@ export async function runJob(params, emit) {
     });
     if (!sources.length) throw new Error(`No downloadable videos found for "${category}". Try another category.`);
     sources.forEach((v, i) => {
-      const isPexels = (v.provider || 'youtube') === 'pexels';
-      job.sources.push({ id: v.id, provider: isPexels ? 'pexels' : 'youtube', title: v.title, channel: v.channel, views: v.views, duration: v.duration,
-        url: isPexels ? (v.page || '') : `https://www.youtube.com/watch?v=${v.id}`, thumb: api.thumb(v), status: 'queued', percent: 0, peakScore: null, avgScore: null });
+      const provider = v.provider || 'youtube';
+      const isYouTube = provider === 'youtube';
+      job.sources.push({ id: v.id, provider, title: v.title, channel: v.channel, views: v.views, duration: v.duration,
+        url: isYouTube ? `https://www.youtube.com/watch?v=${v.id}` : (v.page || ''), thumb: api.thumb(v), status: 'queued', percent: 0, peakScore: null, avgScore: null });
       log(`#${i + 1} ${v.title} — ${fmtViews(v.views)} views`);
     });
     save();
@@ -87,7 +100,7 @@ export async function runJob(params, emit) {
       try {
         const info = await api.player(entry.id, entry.provider || source);
         entry.duration = info.duration || entry.duration;
-        const videos = info.streams.filter((s) => s.kind === 'video' && s.height > 0 && s.mimeType.includes('mp4'));
+        const videos = info.streams.filter((s) => s.kind === 'video' && s.mimeType.includes('mp4'));
         const best = videos.filter((s) => s.height <= quality).sort((a, b) => b.height - a.height)[0]
                    || videos.sort((a, b) => a.height - b.height)[0];
         if (!best) throw new Error('no compatible video stream');

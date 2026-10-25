@@ -188,6 +188,16 @@ function http_get_json(string $url, array $headers = [], int $timeout = 30): arr
     return ['status' => $status, 'body' => (string) $out];
 }
 
+/** Sniff an image's content type from its magic bytes (proxied covers can be
+ *  JPEG/PNG/WebP and we must not assume one). */
+function image_content_type(string $bytes): string {
+    if (str_starts_with($bytes, "\xFF\xD8\xFF")) return 'image/jpeg';
+    if (str_starts_with($bytes, "\x89PNG\r\n\x1A\n")) return 'image/png';
+    if (str_starts_with($bytes, 'RIFF') && substr($bytes, 8, 4) === 'WEBP') return 'image/webp';
+    if (str_starts_with($bytes, 'GIF87a') || str_starts_with($bytes, 'GIF89a')) return 'image/gif';
+    return 'image/jpeg';
+}
+
 function http_get_bytes(string $url, ?string $range = null, int $timeout = 30): ?string {
     $headers = 'User-Agent: ' . UA_BROWSER . "\r\n";
     if ($range !== null) $headers .= 'Range: bytes=' . $range . "\r\n";
@@ -288,19 +298,135 @@ function parse_views(string $text): int {
 }
 
 /** True only for hosts we are willing to relay bytes from (SSRF guard).
- *  Covers the YouTube CDN plus the Pexels CDN used by the fallback source. */
+ *  Covers the YouTube CDN, the Pexels CDN and Internet Archive (keyless). */
 function is_youtube_cdn_host(string $host): bool {
     $host = strtolower($host);
     return $host === 'googlevideo.com' || str_ends_with($host, '.googlevideo.com')
         || $host === 'ytimg.com' || str_ends_with($host, '.ytimg.com')
         || $host === 'youtube.com' || str_ends_with($host, '.youtube.com')
-        || $host === 'pexels.com' || str_ends_with($host, '.pexels.com');
+        || $host === 'pexels.com' || str_ends_with($host, '.pexels.com')
+        || $host === 'archive.org' || str_ends_with($host, '.archive.org');
 }
 
+/* ── Internet Archive (free forever, NO key: https://archive.org/developers) ──
+ * Progressive faststart MP4s served with real Range support, so the byte-range
+ * downloader and the cutting stage work unchanged. Used as the last resort
+ * when YouTube blocks the host and no Pexels key is configured. */
+function archive_metadata(string $id): ?array {
+    try {
+        $res = http_get_json('https://archive.org/metadata/' . rawurlencode($id), [], 25);
+        if ($res['status'] !== 200) return null;
+        $d = json_decode($res['body'], true);
+        return is_array($d) && !empty($d['server']) ? $d : null;
+    } catch (Throwable) {
+        return null;
+    }
+}
+
+/** Fetch many item metadata records at once (parallel — search stays fast). */
+function archive_metadata_bulk(array $ids, int $max = 24): array {
+    $ids = array_slice(array_values(array_unique($ids)), 0, $max);
+    $out = [];
+    if (!function_exists('curl_multi_init')) {
+        foreach ($ids as $id) { $m = archive_metadata($id); if ($m) $out[$id] = $m; }
+        return $out;
+    }
+    $mh = curl_multi_init();
+    $handles = [];
+    foreach ($ids as $id) {
+        $ch = curl_init('https://archive.org/metadata/' . rawurlencode($id));
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT => 25, CURLOPT_CONNECTTIMEOUT => 8, CURLOPT_USERAGENT => UA_BROWSER,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$id] = $ch;
+    }
+    do {
+        $status = curl_multi_exec($mh, $active);
+        if ($active) curl_multi_select($mh, 1.0);
+    } while ($active && $status === CURLM_OK);
+    foreach ($handles as $id => $ch) {
+        $body = (string) curl_multi_getcontent($ch);
+        if ((int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE) === 200 && $body !== '') {
+            $j = json_decode($body, true);
+            if (is_array($j) && !empty($j['server'])) $out[$id] = $j;
+        }
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+    }
+    curl_multi_close($mh);
+    return $out;
+}
+
+/** "34:56" | "1:02:03" | "1234.56" → seconds. */
+function archive_parse_length(string $raw): int {
+    $raw = trim($raw);
+    if ($raw === '') return 0;
+    if (preg_match('/^(\d+):(\d{2})(?::(\d{2}))?$/', $raw, $m)) {
+        return isset($m[3]) ? (int) $m[1] * 3600 + (int) $m[2] * 60 + (int) $m[3]
+                            : (int) $m[1] * 60 + (int) $m[2];
+    }
+    return (int) floor((float) $raw);
+}
+
+/** Best mp4 derivative of an item: prefer real dimensions, then file size. */
+function archive_best_mp4(array $meta): ?array {
+    $best = null;
+    foreach (($meta['files'] ?? []) as $f) {
+        if (!is_array($f)) continue;
+        $name = (string) ($f['name'] ?? '');
+        if (!preg_match('/\.mp4$/i', $name)) continue;
+        $size = (int) ($f['size'] ?? 0);
+        $w = (int) ($f['width'] ?? 0);
+        $score = $w * 1000 + min($size, 3_000_000_000) / 1e6;
+        if ($best === null || $score > $best['score']) {
+            $best = [
+                'score' => $score, 'name' => $name, 'size' => $size,
+                'width' => $w, 'height' => (int) ($f['height'] ?? 0),
+                'length' => (string) ($f['length'] ?? ''), 'format' => (string) ($f['format'] ?? ''),
+            ];
+        }
+    }
+    return $best;
+}
+
+function archive_file_url(array $meta, string $name): string {
+    $server = rtrim((string) ($meta['server'] ?? 'archive.org'), '/');
+    $dir = trim((string) ($meta['dir'] ?? ''), '/');
+    $path = implode('/', array_map('rawurlencode', explode('/', $name)));
+    return "{$server}/{$dir}/{$path}";
+}
+
+/** Normalize an archive item into the shape the research agent expects. */
+function archive_normalize(array $meta, array $doc, string $query): ?array {
+    $file = archive_best_mp4($meta);
+    if (!$file) return null;
+    $id = (string) ($doc['identifier'] ?? $meta['metadata']['identifier'] ?? '');
+    if ($id === '') return null;
+    $dur = archive_parse_length($file['length']);
+    if ($dur < limits()['minSourceDurationSec'] || $dur > 3600) return null;
+    $title = trim((string) ($doc['title'] ?? $meta['metadata']['title'] ?? ''));
+    if (is_array($title)) $title = trim((string) ($title[0] ?? ''));
+    if ($title === '') $title = $query;
+    $creator = trim((string) (($meta['metadata']['creator'] ?? '') ?: ($meta['metadata']['sponsor'] ?? '')));
+    if (is_array($creator)) $creator = trim((string) ($creator[0] ?? ''));
+    return [
+        'id' => $id,
+        'title' => mb_substr($title, 0, 90),
+        'channel' => $creator !== '' ? $creator : 'Internet Archive',
+        'duration' => $dur,
+        'views' => (int) ($doc['downloads'] ?? 0),
+        'thumb' => "https://archive.org/services/img/{$id}",
+        'live' => false,
+        'provider' => 'archive',
+        'page' => "https://archive.org/details/{$id}",
+        'file' => $file['name'],
+    ];
+}
 /* ── Pexels source (free forever: https://www.pexels.com/api/) ──────────────
- * Used when YouTube's player API refuses this server's IP. Direct progressive
- * MP4 files, so the byte-range downloader and the ffmpeg cutting stage work
- * unchanged. */
+ * Direct progressive MP4 files — used when it is configured, ahead of the
+ * Internet Archive fallback. */
 function pexels_available(): bool {
     return cfg()['pexelsKey'] !== '';
 }

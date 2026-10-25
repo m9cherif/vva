@@ -49,7 +49,44 @@ if ($provider === 'pexels') {
         fail('Pexels stream resolution failed: ' . $e->getMessage(), 502);
     }
 }
-if ($provider !== 'youtube') fail("unknown provider \"{$provider}\" (use youtube or pexels)");
+/* ── Internet Archive: item metadata → direct faststart MP4 ─────────────── */
+if ($provider === 'archive') {
+    if (!preg_match('/^[A-Za-z0-9._-]{3,80}$/', $id)) fail('invalid item id');
+    try {
+        $meta = archive_metadata($id);
+        if (!$meta) fail('archive item not found', 404);
+        $file = archive_best_mp4($meta);
+        if (!$file) fail('this archive item has no mp4 file', 409);
+        $md = is_array($meta['metadata'] ?? null) ? $meta['metadata'] : [];
+        $title = (string) ($md['title'] ?? $id);
+        if (is_array($title)) $title = (string) ($title[0] ?? $id);
+        $creator = (string) (($md['creator'] ?? '') ?: 'Internet Archive');
+        if (is_array($creator)) $creator = (string) ($creator[0] ?? 'Internet Archive');
+        json_out([
+            'id' => $id,
+            'provider' => 'archive',
+            'duration' => archive_parse_length($file['length']),
+            'title' => mb_substr($title, 0, 90),
+            'channel' => $creator,
+            'views' => 0,
+            'streams' => [[
+                'itag' => 0,
+                'kind' => 'video',
+                'url' => archive_file_url($meta, $file['name']),
+                'mimeType' => 'video/mp4',
+                'width' => $file['width'],
+                'height' => $file['height'],
+                'fps' => 0, 'bitrate' => 0,
+                'contentLength' => $file['size'],
+                'audioQuality' => '',
+            ]],
+        ]);
+    } catch (Throwable $e) {
+        fail('Archive stream resolution failed: ' . $e->getMessage(), 502);
+    }
+}
+
+if ($provider !== 'youtube') fail("unknown provider \"{$provider}\" (use youtube, pexels or archive)");
 if (!preg_match('/^[A-Za-z0-9_-]{11}$/', $id)) fail('invalid video id');
 
 try {

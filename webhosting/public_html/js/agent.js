@@ -4,11 +4,12 @@ const SYSTEM=`You are the research agent inside an automated viral-clip studio.
 Your job: find the BEST source videos to mine for viral clips in a given category.
 Each turn you receive the state and candidate videos (title, channel, duration, views). Covers are attached in the SAME ORDER as the list.
 Reply with EXACTLY one JSON object: {"reason":"...","keep":[ids],"drop":[ids],"search":"new query or null","done":false}
-Rules: keep only shown ids; duration must be >= MIN_DURATION but length is NEVER a reason to drop; prefer CONTINUITY (one continuous subject, drop TOP-100 compilations); prefer strong covers/views; vary every query; done:true when enough or budget gone.`;
-export async function researchSources({category,need,minDuration,log=()=>{}}){
+Rules: keep only shown ids. Prefer duration >= MIN_DURATION and prefer CONTINUITY (one continuous subject) — but both are PREFERENCES, never hard filters: when nothing better is available, KEEP the best candidate you have. Completions/compilations are acceptable as a fallback once single-subject options are gone. Prefer strong covers/views; vary every query. NEVER end with keep=[] while candidates are on screen — pick the best of what exists. done:true only when enough are kept or the search budget is gone.`;
+export async function researchSources({category,need,minDuration,spare=0,log=()=>{}}){
+  const target=need+spare;
   const seen=new Map(),kept=[],dropped=new Set(),history=[];let pool=[],searches=0,round=0,lastQuery=null,malformed=0,stopped='';
   const note=t=>log(t);
-  note(`🤖 Agent researching "${category}" — needs ${need} videos (≥${minDuration}s)`);
+  note(`🤖 Agent researching "${category}" — needs ${need} videos (≥${minDuration}s)${spare?` (+${spare} spare)`:''}`);
   while(round<MAX_ROUNDS){
     round++;
     const cands=pool.filter(v=>!dropped.has(v.id)&&!kept.some(k=>k.id===v.id)).slice(0,IMAGES_PER_TURN);
@@ -27,7 +28,7 @@ export async function researchSources({category,need,minDuration,log=()=>{}}){
     for(const id of Array.isArray(d.keep)?d.keep:[]){const c=seen.get(String(id));if(c&&!dropped.has(c.id)&&!kept.some(k=>k.id===c.id)){kept.push(c);note(`✅ kept "${c.title}" — ${c.duration}s · ${c.views} views`);}}
     for(const id of Array.isArray(d.drop)?d.drop:[]){const c=seen.get(String(id));if(c&&!kept.some(k=>k.id===c.id)&&!dropped.has(c.id)){dropped.add(c.id);note(`❌ dropped "${c.title}"${reason?` — ${reason}`:''}`);}}
     if(d.done&&reason)note(`🧠 ${reason}`);
-    if(kept.length>=need){stopped=`found ${kept.length}/${need} videos`;break;}
+    if(kept.length>=target){stopped=`found ${kept.length}/${need} videos`;break;}
     if(d.done){stopped=reason||'agent satisfied';break;}
     const q=typeof d.search==='string'?d.search.trim().slice(0,120):'';
     if(q&&searches<MAX_SEARCHES){
@@ -39,8 +40,10 @@ export async function researchSources({category,need,minDuration,log=()=>{}}){
     history.push({role:'user',content:searches>=MAX_SEARCHES?'Search budget exhausted — decide with what is on screen.':'Give a decision: keep, drop, search or done.'});
   }
   if(!stopped)stopped=`round limit (${MAX_ROUNDS}) reached`;
-  if(kept.length<need){[...seen.values()].filter(v=>!dropped.has(v.id)&&!kept.some(k=>k.id===v.id)).sort((a,b)=>b.views-a.views).forEach(v=>{if(kept.length<need){kept.push(v);note(`➕ topped up with "${v.title}" (${v.views} views)`);}});}
-  if(!kept.length)throw new Error(`The AI research agent could not find usable videos for "${category}". Try another category.`);
+  // Fill up from everything we ever saw — including videos the agent dropped —
+  // rather than failing the whole job over a strict judgment call.
+  if(kept.length<target){[...seen.values()].filter(v=>!kept.some(k=>k.id===v.id)).sort((a,b)=>b.views-a.views).forEach(v=>{if(kept.length<target){kept.push(v);note(`➕ topped up with "${v.title}" (${v.views} views)`);}});}
+  if(!kept.length)throw new Error(`The AI research agent found no videos at all for "${category}". Try another category.`);
   note(`🎯 agent finished: ${kept.length} video${kept.length===1?'':'s'} selected (${stopped})`);
-  return {videos:kept.slice(0,need)};
+  return {videos:kept.slice(0,target)};
 }

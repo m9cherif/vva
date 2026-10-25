@@ -44,7 +44,7 @@ export async function runJob(params, emit) {
     stage('searching', 4, `AI agent is researching ${category} videos`);
     let turn = 0;
     const { videos: sources } = await researchSources({
-      category, need: sourceCount, minDuration: clipLength + 10,
+      category, need: sourceCount, minDuration: clipLength + 10, spare: 2,
       log: (text) => { turn++; log(text); stage('searching', Math.min(9, 4 + turn * 0.35), 'AI agent researching sources'); },
     });
     if (!sources.length) throw new Error(`No downloadable videos found for "${category}". Try another category.`);
@@ -55,10 +55,10 @@ export async function runJob(params, emit) {
     });
     save();
 
-    /* 2 ─ Stream resolution + window download */
+    /* 2 ─ Stream resolution */
     stage('downloading', 10, `Resolving streams for ${sources.length} videos`);
-    const prepared = [];
-    await mapPool(job.sources, 2, async (entry, idx) => {
+    const resolved = [];
+    await mapPool(job.sources, 3, async (entry, idx) => {
       try {
         const info = await api.player(entry.id);
         entry.duration = info.duration || entry.duration;
@@ -66,24 +66,71 @@ export async function runJob(params, emit) {
         const best = videos.filter((s) => s.height <= quality).sort((a, b) => b.height - a.height)[0]
                    || videos.sort((a, b) => a.height - b.height)[0];
         if (!best) throw new Error('no compatible video stream');
+        resolved.push({ entry, idx, best, info });
+      } catch (err) {
+        entry.status = 'failed'; srcEvent(entry);
+        log(`Skipped "${entry.title}" — ${String(err.message || err).slice(0, 160)}`);
+      }
+    });
+    if (!resolved.length) throw new Error('No streams could be resolved — YouTube may be rate-limiting. Retry in a minute.');
+
+    /* 2b ─ AI WATCHES A PREVIEW — before downloading any full window.
+     * 12 seconds of bytes + 2 frames is enough for the vision model to judge
+     * the footage, so weak sources are rejected before we pay for them. */
+    stage('downloading', 16, `AI previewing ${resolved.length} videos before downloading`);
+    const PREVIEW_SEC = 12;
+    const previews = await mapPool(resolved, 3, async (r) => {
+      try {
+        const dl = await downloadPrefix({ ...r.best, durationSec: r.info.duration }, PREVIEW_SEC, () => {});
+        const { frames } = await extractFrames(dl.blob, { intervalSec: interval, limitSec: Math.min(PREVIEW_SEC, dl.coveredSec || PREVIEW_SEC) });
+        if (frames.length < 2) throw new Error('preview too short to judge');
+        const { scores, model } = await scoreFrames(frames, { interval, videoTitle: r.entry.title });
+        if (model && !job.model) { job.model = model; log(`Vision model in use: ${model}`); }
+        const peak = Math.max(...scores.map((s) => s.score));
+        const avg = Math.round(scores.reduce((n, s) => n + s.score, 0) / scores.length);
+        return { ...r, preview: { scores, peak, avg } };
+      } catch (err) {
+        log(`Preview failed for "${r.entry.title}" — ${String(err.message || err).slice(0, 140)}`);
+        return null;
+      }
+    });
+    const ranked = previews.filter(Boolean).sort((a, b) => b.preview.peak - a.preview.peak);
+    if (!ranked.length) throw new Error('The AI could not preview any source video. Try running again.');
+    const keepN = Math.max(1, Math.min(sourceCount, ranked.length));
+    const survivors = ranked.slice(0, keepN).filter((r, i) => r.preview.peak >= 10 || i === 0);
+    const survivorIds = new Set(survivors.map((s) => s.entry.id));
+    ranked.forEach((r) => {
+      if (survivorIds.has(r.entry.id)) return;
+      r.entry.status = 'failed'; srcEvent(r.entry);
+      log(`👀 rejected after preview — "${r.entry.title}" peaked ${r.preview.peak}/100 (keeping the best ${survivors.length})`);
+    });
+    survivors.forEach((r, i) => {
+      log(`👀 AI watched preview ${i + 1}/${survivors.length}: "${r.entry.title}" — peak ${r.preview.peak}/100, avg ${r.preview.avg}/100`);
+    });
+
+    /* 2c ─ full window download — only for videos that passed the preview */
+    stage('downloading', 30, `Downloading ${survivors.length} video${survivors.length === 1 ? '' : 's'} that passed the preview`);
+    const prepared = [];
+    await mapPool(survivors, 3, async (r) => {
+      const entry = r.entry;
+      try {
         const window = Math.min(windowSeconds, entry.duration || windowSeconds);
         entry.status = 'downloading'; srcEvent(entry);
-        const dl = await downloadPrefix({ ...best, durationSec: info.duration }, window, (pct) => {
+        const dl = await downloadPrefix({ ...r.best, durationSec: r.info.duration }, window, (pct) => {
           if (pct === entry.percent) return;
           entry.percent = pct; srcEvent(entry);
         });
-        const got = dl.blob;
         entry.status = 'downloaded'; entry.percent = 100; entry.localDuration = dl.coveredSec; srcEvent(entry);
-        log(`Ready "${entry.title}" — ${dl.coveredSec}s window, ${(got.size / 1048576).toFixed(1)} MB at ${best.height}p`);
-        prepared.push({ video: entry, blob: got, duration: dl.coveredSec, height: best.height, index: idx, base: info });
+        log(`Ready "${entry.title}" — ${dl.coveredSec}s window, ${(dl.blob.size / 1048576).toFixed(1)} MB at ${r.best.height}p`);
+        prepared.push({ video: entry, blob: dl.blob, duration: dl.coveredSec, height: r.best.height, index: r.idx, base: r.info, preview: r.preview });
       } catch (err) {
         entry.status = 'failed'; srcEvent(entry);
         log(`Skipped "${entry.title}" — ${String(err.message || err).slice(0, 160)}`);
       }
     });
     if (!prepared.length) throw new Error('All source downloads failed — YouTube may be rate-limiting. Retry in a minute.');
-    log(`${prepared.length}/${job.sources.length} videos ready for analysis`);
-    stage('downloading', 32, 'Sampling frames from every video');
+    log(`${prepared.length}/${job.sources.length} videos passed the AI preview and are ready`);
+    stage('downloading', 40, 'Sampling frames from every video');
 
     /* 3 ─ Frames */
     const analyze = [];
@@ -105,14 +152,29 @@ export async function runJob(params, emit) {
     let doneFrames = 0;
     await mapPool(analyze, 2, async (item) => {
       try {
-        const { scores, model } = await scoreFrames(item.frames, {
-          interval, videoTitle: item.video.title,
-          onBatch: (b) => {
-            if (b.model && !job.model) { job.model = b.model; log(`Vision model in use: ${b.model}`); }
-            doneFrames += b.done;
-            stage('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${doneFrames}/${totalFrames})`);
-          },
-        });
+        // Frames already judged during the preview pass are reused — only the
+        // remaining footage is sent to the vision model.
+        const key = (t) => Math.round(Number(t) * 100) / 100;
+        const frameKeys = new Set(item.frames.map((f) => key(f.t)));
+        const carried = (item.preview?.scores || []).filter((s) => frameKeys.has(key(s.t)));
+        const carriedKeys = new Set(carried.map((s) => key(s.t)));
+        const fresh = item.frames.filter((f) => !carriedKeys.has(key(f.t)));
+        doneFrames += item.frames.length - fresh.length;
+        let freshScores = [];
+        if (fresh.length) {
+          const res = await scoreFrames(fresh, {
+            interval, videoTitle: item.video.title,
+            onBatch: (b) => {
+              if (b.model && !job.model) { job.model = b.model; log(`Vision model in use: ${b.model}`); }
+              doneFrames += b.done;
+              stage('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${doneFrames}/${totalFrames})`);
+            },
+          });
+          freshScores = res.scores;
+        }
+        const scores = [...carried, ...freshScores].sort((a, b) => a.t - b.t);
+        if (!scores.length) throw new Error('no frame scores');
+        stage('watching', 42 + (doneFrames / totalFrames) * 34, `AI watching frames (${Math.min(doneFrames, totalFrames)}/${totalFrames})`);
         item.scores = scores;
         item.best = scores.reduce((m, s) => Math.max(m, s.score), 0);
         item.avg = Math.round(scores.reduce((n, s) => n + s.score, 0) / scores.length);

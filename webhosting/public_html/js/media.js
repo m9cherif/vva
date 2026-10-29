@@ -102,10 +102,11 @@ const loadListeners = new Set();
 export function onFfmpegLoad(cb) { loadListeners.add(cb); return () => loadListeners.delete(cb); }
 const emitLoad = (p) => { for (const cb of loadListeners) { try { cb(p); } catch { /* listener bug */ } } };
 
-async function downloadBytes(url, { retries = 4, stallSec = 15 } = {}) {
+async function downloadBytes(url, { retries = 4, stallSec = 15, silent = false } = {}) {
   /* Slow links stall for minutes: watch for byte silence, abort, and resume
    * with a Range request (the host serves static files with Accept-Ranges).
    * Every attempt continues where the last one stopped. */
+  const tell = silent ? () => {} : emitLoad;
   const chunks = [];
   let got = 0, total = 0, last = -1;
   let res = null;
@@ -118,7 +119,8 @@ async function downloadBytes(url, { retries = 4, stallSec = 15 } = {}) {
       res = await fetch(url, { cache: 'force-cache', headers, signal: ctl.signal });
       if (res.status === 416) {                                        // past EOF: have it all
         if (total && got >= total) break;
-        throw new Error('HTTP 416');
+        chunks.length = 0; got = 0;                                    // file changed (redeploy) — restart
+        continue;
       }
       if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
       if (res.status === 200) { chunks.length = 0; got = 0; }        // Range ignored: restart
@@ -127,11 +129,11 @@ async function downloadBytes(url, { retries = 4, stallSec = 15 } = {}) {
       total = m ? Number(m[1]) : got + (Number(res.headers.get('content-length')) || 0);
       if (!res.body) {
         const buf = new Uint8Array(await res.arrayBuffer());
-        emitLoad(100);
+        tell(100);
         return buf;
       }
       const reader = res.body.getReader();
-      if (got === 0) emitLoad(0);
+      if (got === 0) tell(0);
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -139,14 +141,14 @@ async function downloadBytes(url, { retries = 4, stallSec = 15 } = {}) {
         chunks.push(value);
         got += value.length;
         const p = Math.min(99, Math.round((got / Math.max(total, 1)) * 100));
-        if (p >= last + 10) { last = p; emitLoad(p); }
+        if (p >= last + 10) { last = p; tell(p); }
       }
       clearTimeout(stallTimer);
-      emitLoad(100);
+      tell(100);
       break;                                                          // complete
     } catch (err) {
       if (attempt === retries) throw new Error(`download stalled repeatedly (${String(err.name || err)})`);
-      emitLoad(Math.min(99, Math.round((got / Math.max(total, 1)) * 100)));  // resume from here
+      tell(Math.min(99, Math.round((got / Math.max(total, 1)) * 100)));  // resume from here
     } finally {
       clearTimeout(stallTimer);
     }
@@ -178,6 +180,20 @@ async function wasmBytes() {
   }
 }
 
+/* The encoder spawns its worker threads on demand (at the first real encode):
+ * each one fetches the core worker script over the network and then
+ * importScripts()es the core JS. On a stalled link those tiny fetches hang for
+ * minutes and the encode freezes at frame 1 waiting for threads that never
+ * start. Both files are therefore downloaded here through the same resumable
+ * downloader and handed to ffmpeg as blob URLs — with the wasm blob that
+ * makes the whole encode network-free. */
+const CORE_JS_URL = '/assets/ffmpeg/ffmpeg-core.js?v=build1';
+const CORE_WORKER_URL = '/assets/ffmpeg/ffmpeg-core.worker.js?v=build1';
+let coreJSBlobURL = null;
+let coreWorkerBlobURL = null;
+const assetBlobURL = async (url) =>
+  URL.createObjectURL(new Blob([await downloadBytes(url, { silent: true })], { type: 'text/javascript' }));
+
 export function ffmpeg() {
   if (!ffPromise) ffPromise = (async () => {
     emitLoad(0);
@@ -186,10 +202,16 @@ export function ffmpeg() {
       const { FFmpeg } = window.FFmpegWASM;
       const ff = new FFmpeg();
       const wasmURL = URL.createObjectURL(new Blob([await wasmBytes()], { type: 'application/wasm' }));
+      if (!coreJSBlobURL) {
+        try {
+          coreJSBlobURL = await assetBlobURL(CORE_JS_URL);
+          coreWorkerBlobURL = await assetBlobURL(CORE_WORKER_URL);
+        } catch { /* fall back to plain URLs — the workers then fetch them */ }
+      }
       await ff.load({
-        coreURL: '/assets/ffmpeg/ffmpeg-core.js',
+        coreURL: coreJSBlobURL || CORE_JS_URL,
         wasmURL,
-        workerURL: '/assets/ffmpeg/ffmpeg-core.worker.js',
+        workerURL: coreWorkerBlobURL || CORE_WORKER_URL,
       });
       return ff;
     })();
@@ -256,7 +278,13 @@ export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '
       beat();
     }
     const vf = aspectFilter(aspect);
-    const args = [...inputs, '-t', span.toFixed(2)];
+    /* Threads pinned to 1 on purpose: this multithreaded core deadlocks in
+     * some browsers the instant libx264 or a filter spawns a worker thread —
+     * the encode froze at frame 1 forever with zero network activity left to
+     * blame (verified in-page: the same core encodes reliably with threads=1).
+     * Single-threaded wasm x264 is still fast enough for short clips, and the
+     * stall watchdog above is the safety net for anything unexpected. */
+    const args = ['-threads', '1', '-filter_threads', '1', ...inputs, '-t', span.toFixed(2)];
     if (vf) args.push('-vf', vf);
     args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
               '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',

@@ -1,9 +1,11 @@
 # ── ViralClips Studio — Hostinger shared hosting (LiteSpeed/Apache) ────────
 
-# ffmpeg.wasm runs multithreaded, which browsers only allow on
-# cross-origin-isolated pages (SharedArrayBuffer). These two headers provide
-# that isolation. Everything the page loads is same-origin (thumbnails and
-# YouTube bytes arrive through our own /api proxies), so require-corp is safe.
+# ffmpeg.wasm (multithreaded core) only gets SharedArrayBuffer on
+# cross-origin-isolated pages. The encoder is currently pinned to a single
+# thread (media.js — the MT build deadlocks on worker threads in some
+# browsers), but the isolation headers stay: they cost nothing here (every
+# subresource is same-origin, thumbnails and YouTube bytes arrive through our
+# own /api proxies) and keep the door open for multithreading later.
 <IfModule mod_headers.c>
   Header always set Cross-Origin-Opener-Policy "same-origin"
   Header always set Cross-Origin-Embedder-Policy "require-corp"

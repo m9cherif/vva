@@ -5,7 +5,7 @@
 import { api } from './api.js?v=build1';
 import { researchSources } from './agent.js?v=build1';
 import { downloadPrefix } from './downloader.js?v=build1';
-import { extractFrames, scoreFrames, generateCopy, cutClip, ffmpeg } from './media.js?v=build1';
+import { extractFrames, scoreFrames, generateCopy, cutClip, ffmpeg, onFfmpegLoad } from './media.js?v=build1';
 
 const interval = 6;
 const mapPool = async (items, n, worker) => {
@@ -41,8 +41,18 @@ export async function runJob(params, emit) {
   const srcEvent = (entry) => emit({ type: 'source', source: entry });
 
   try {
-    // warm up ffmpeg in the background while the agent researches
-    ffmpeg().catch(() => {});
+    /* Warm the encoder up while the agent researches: the core is a ~10-33 MB
+     * wasm and on a slow link it needs that head start. Progress is surfaced
+     * so a first-time visitor sees "downloading encoder", never a stalled bar. */
+    let lastLoadPct = -1;
+    onFfmpegLoad((p) => {
+      if (p === 0 || p === 100 || p - lastLoadPct >= 25) {
+        lastLoadPct = p;
+        log(p === 100 ? '🎬 video encoder ready' : `⬇ downloading video encoder… ${p}%`);
+      }
+      if (job.stage === 'cutting' && p < 100) stageUp('cutting', job.percent, `Loading video encoder… ${p}%`);
+    });
+    ffmpeg().catch((e) => { log(`⚠ video encoder failed to load: ${String(e.message || e).slice(0, 130)}`); });
 
     /* 0 ─ Source chain: YouTube → Pexels (if a key is configured) → Internet
      * Archive (keyless, free forever). YouTube's player can resolve one probe

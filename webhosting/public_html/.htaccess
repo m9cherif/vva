@@ -33,11 +33,24 @@
   <FilesMatch "\.(js|mjs|css|html)$">
     Header set Cache-Control "no-cache, must-revalidate"
   </FilesMatch>
+  # The ffmpeg core is a 33 MB wasm — every re-download costs the visitor
+  # minutes on a slow link. Keep it for 30 days; when the core itself is
+  # replaced, the code bumps the ?v= query so a fresh copy is fetched.
+  <FilesMatch "\.wasm$">
+    Header set Cache-Control "public, max-age=2592000"
+  </FilesMatch>
 </IfModule>
 <IfModule mod_expires.c>
   ExpiresActive On
-  ExpiresByType wasm/wasm "access plus 1 week"
   ExpiresByType image/svg+xml "access plus 1 week"
+</IfModule>
+
+# LiteSpeed serves .wasm as text/plain by default, which disables both the
+# expiry rules above and response compression. With the real type the 33 MB
+# encoder core compresses to ~10 MB (about a third of the wait on slow links).
+AddType application/wasm .wasm
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE application/wasm application/javascript text/javascript text/css text/html application/json image/svg+xml
 </IfModule>
 
 # Larger JSON payloads (AI vision batches) need room on the way in.

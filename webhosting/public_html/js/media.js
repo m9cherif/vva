@@ -89,17 +89,66 @@ export async function generateCopy(segments) {
 
 /* ── ffmpeg.wasm ────────────────────────────────────────────────────────── */
 let ffPromise = null;
+const WASM_URL = '/assets/ffmpeg/ffmpeg-core.wasm?v=build1';
+const WASM_SIZE = 32_718_323;            // decoded size, used when gzip hides Content-Length
+const delay = (ms, msg) => new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms));
+
+/* The 33 MB core is fetched through the page (not hidden inside the worker)
+ * so the job can show real download progress and hand the bytes to ffmpeg as
+ * a blob URL — that also guarantees a single download per page load. */
+const loadListeners = new Set();
+export function onFfmpegLoad(cb) { loadListeners.add(cb); return () => loadListeners.delete(cb); }
+const emitLoad = (p) => { for (const cb of loadListeners) { try { cb(p); } catch { /* listener bug */ } } };
+
+async function wasmBlobURL() {
+  const res = await fetch(WASM_URL, { cache: 'force-cache' });
+  if (!res.ok) throw new Error(`encoder download failed (HTTP ${res.status})`);
+  const declared = Number(res.headers.get('content-length')) || 0;
+  // With Content-Encoding: gzip the header counts compressed bytes while the
+  // reader yields decoded ones — compare against the known real size instead.
+  const total = res.headers.get('content-encoding') ? WASM_SIZE : Math.max(declared, 1);
+  if (!res.body) {
+    const blob = await res.blob();
+    emitLoad(100);
+    return URL.createObjectURL(blob);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0, lastEmit = -1;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    const p = Math.min(99, Math.round((got / total) * 100));
+    if (p >= lastEmit + 10) { lastEmit = p; emitLoad(p); }
+  }
+  emitLoad(100);
+  return URL.createObjectURL(new Blob(chunks, { type: 'application/wasm' }));
+}
+
 export function ffmpeg() {
   if (!ffPromise) ffPromise = (async () => {
-    await loadScript('/assets/ffmpeg/ffmpeg.js');
-    const { FFmpeg } = window.FFmpegWASM;
-    const ff = new FFmpeg();
-    await ff.load({
-      coreURL: '/assets/ffmpeg/ffmpeg-core.js',
-      wasmURL: '/assets/ffmpeg/ffmpeg-core.wasm',
-      workerURL: '/assets/ffmpeg/ffmpeg-core.worker.js',
-    });
-    return ff;
+    emitLoad(0);
+    const load = (async () => {
+      await loadScript('/assets/ffmpeg/ffmpeg.js');
+      const { FFmpeg } = window.FFmpegWASM;
+      const ff = new FFmpeg();
+      const wasmURL = await wasmBlobURL();
+      await ff.load({
+        coreURL: '/assets/ffmpeg/ffmpeg-core.js',
+        wasmURL,
+        workerURL: '/assets/ffmpeg/ffmpeg-core.worker.js',
+      });
+      return ff;
+    })();
+    // A stalled fetch must never hang the job: race the load against a hard
+    // deadline (first visit downloads ~10-33 MB) and drop the cached promise
+    // on timeout so the next attempt starts clean.
+    return await Promise.race([
+      load,
+      delay(180_000, 'video encoder did not finish loading within 180s (network stall) — retrying on the next clip'),
+    ]);
   })().catch((e) => { ffPromise = null; throw e; });
   return ffPromise;
 }
@@ -126,31 +175,60 @@ export function aspectFilter(aspect) {
 export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '16:9', onProgress = () => {} }) {
   const ff = await ffmpeg();
   const files = [];
-  await ff.writeFile('in.mp4', new Uint8Array(await videoBlob.arrayBuffer()));
-  files.push('in.mp4');
-  let inputs = ['-ss', startSec.toFixed(2), '-i', 'in.mp4'];
-  if (audioBlob && audioBlob.size > 1024) {
-    await ff.writeFile('in_audio.mp4', new Uint8Array(await audioBlob.arrayBuffer()));
-    files.push('in_audio.mp4');
-    inputs = ['-ss', startSec.toFixed(2), '-i', 'in.mp4', '-ss', startSec.toFixed(2), '-i', 'in_audio.mp4',
-              '-map', '0:v:0', '-map', '1:a:0'];
-  }
-  const vf = aspectFilter(aspect);
-  const args = [...inputs, '-t', span.toFixed(2)];
-  if (vf) args.push('-vf', vf);
-  args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
-            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
-            '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero', '-y', 'out.mp4');
+  let lastBeat = Date.now();
+  const beat = () => { lastBeat = Date.now(); };
+  /* Stall watchdog: if ffmpeg reports nothing for 45 s the encode is dead
+   * (worker died, socket wedged) — fail the clip instead of hanging forever. */
+  let timer = null;
+  const watchdog = new Promise((_, rej) => {
+    timer = setInterval(() => {
+      if (Date.now() - lastBeat > 45_000) {
+        rej(new Error('encoding stalled — ffmpeg made no progress for 45s'));
+      }
+    }, 5_000);
+  });
 
-  const onProg = ({ progress }) => { if (typeof progress === 'number') onProgress(Math.min(100, Math.round(progress * 100))); };
-  ff.on('progress', onProg);
+  const run = async () => {
+    await ff.writeFile('in.mp4', new Uint8Array(await videoBlob.arrayBuffer()));
+    files.push('in.mp4');
+    let inputs = ['-ss', startSec.toFixed(2), '-i', 'in.mp4'];
+    if (audioBlob && audioBlob.size > 1024) {
+      await ff.writeFile('in_audio.mp4', new Uint8Array(await audioBlob.arrayBuffer()));
+      files.push('in_audio.mp4');
+      inputs = ['-ss', startSec.toFixed(2), '-i', 'in.mp4', '-ss', startSec.toFixed(2), '-i', 'in_audio.mp4',
+                '-map', '0:v:0', '-map', '1:a:0'];
+    }
+    const vf = aspectFilter(aspect);
+    const args = [...inputs, '-t', span.toFixed(2)];
+    if (vf) args.push('-vf', vf);
+    args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+              '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+              '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero', '-y', 'out.mp4');
+
+    const onProg = ({ progress }) => { beat(); if (typeof progress === 'number') onProgress(Math.min(100, Math.round(progress * 100))); };
+    ff.on('progress', onProg);
+    try {
+      beat();
+      await ff.exec(args);
+      beat();
+      const data = await ff.readFile('out.mp4');
+      if (!data || data.byteLength < 10_240) throw new Error('ffmpeg produced no output');
+      return new Blob([data.buffer], { type: 'video/mp4' });
+    } finally {
+      ff.off('progress', onProg);
+    }
+  };
+
   try {
-    await ff.exec(args);
-    const data = await ff.readFile('out.mp4');
-    if (!data || data.byteLength < 10_240) throw new Error('ffmpeg produced no output');
-    return new Blob([data.buffer], { type: 'video/mp4' });
+    return await Promise.race([run(), watchdog]);
+  } catch (err) {
+    /* A wedged runtime is unusable for the next clip either — tear it down
+     * and let the following call reload it from scratch. */
+    try { if (typeof ff.terminate === 'function') ff.terminate(); } catch { /* ignore */ }
+    ffPromise = null;
+    throw err;
   } finally {
-    ff.off('progress', onProg);
+    clearInterval(timer);
     for (const f of files) { try { await ff.deleteFile(f); } catch { /* already gone */ } }
     try { await ff.deleteFile('out.mp4'); } catch { /* already gone */ }
   }

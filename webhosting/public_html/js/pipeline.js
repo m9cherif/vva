@@ -46,7 +46,7 @@ export async function runJob(params, emit) {
      * so a first-time visitor sees "downloading encoder", never a stalled bar. */
     let lastLoadPct = -1;
     onFfmpegLoad((p) => {
-      if (p === 0 || p === 100 || p - lastLoadPct >= 25) {
+      if (p !== lastLoadPct && (p === 0 || p === 100 || p - lastLoadPct >= 25)) {
         lastLoadPct = p;
         log(p === 100 ? '🎬 video encoder ready' : `⬇ downloading video encoder… ${p}%`);
       }

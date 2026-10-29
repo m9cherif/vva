@@ -89,42 +89,64 @@ export async function generateCopy(segments) {
 
 /* ── ffmpeg.wasm ────────────────────────────────────────────────────────── */
 let ffPromise = null;
-const WASM_URL = '/assets/ffmpeg/ffmpeg-core.wasm?v=build1';
-const WASM_SIZE = 32_718_323;            // decoded size, used when gzip hides Content-Length
+const WASM_GZ_URL = '/assets/ffmpeg/ffmpeg-core.wasm.gz?v=build1';
+const WASM_RAW_URL = '/assets/ffmpeg/ffmpeg-core.wasm?v=build1';
 const delay = (ms, msg) => new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms));
 
-/* The 33 MB core is fetched through the page (not hidden inside the worker)
- * so the job can show real download progress and hand the bytes to ffmpeg as
- * a blob URL — that also guarantees a single download per page load. */
+/* The core is a 33 MB wasm and the server does not gzip it. CI publishes a
+ * precompressed .wasm.gz (10 MB) which is fetched here and decompressed in
+ * the page, so the first visit waits for a third of the bytes; the raw file
+ * stays as the fallback (older browsers, missing copy). The bytes are handed
+ * to ffmpeg as a blob URL — one download per page load, visible progress. */
 const loadListeners = new Set();
 export function onFfmpegLoad(cb) { loadListeners.add(cb); return () => loadListeners.delete(cb); }
 const emitLoad = (p) => { for (const cb of loadListeners) { try { cb(p); } catch { /* listener bug */ } } };
 
-async function wasmBlobURL() {
-  const res = await fetch(WASM_URL, { cache: 'force-cache' });
-  if (!res.ok) throw new Error(`encoder download failed (HTTP ${res.status})`);
-  const declared = Number(res.headers.get('content-length')) || 0;
-  // With Content-Encoding: gzip the header counts compressed bytes while the
-  // reader yields decoded ones — compare against the known real size instead.
-  const total = res.headers.get('content-encoding') ? WASM_SIZE : Math.max(declared, 1);
+async function downloadBytes(url, fromZero = false) {
+  const res = await fetch(url, { cache: 'force-cache' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const declared = Number(res.headers.get('content-length')) || 1;
   if (!res.body) {
-    const blob = await res.blob();
     emitLoad(100);
-    return URL.createObjectURL(blob);
+    return new Uint8Array(await res.arrayBuffer());
   }
+  if (fromZero) emitLoad(0);
   const reader = res.body.getReader();
   const chunks = [];
-  let got = 0, lastEmit = -1;
+  let got = 0, last = -1;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
     got += value.length;
-    const p = Math.min(99, Math.round((got / total) * 100));
-    if (p >= lastEmit + 10) { lastEmit = p; emitLoad(p); }
+    const p = Math.min(99, Math.round((got / declared) * 100));
+    if (p >= last + 10) { last = p; emitLoad(p); }
   }
-  emitLoad(100);
-  return URL.createObjectURL(new Blob(chunks, { type: 'application/wasm' }));
+  const out = new Uint8Array(got);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
+async function gunzip(bytes) {
+  if (typeof DecompressionStream === 'undefined') throw new Error('no DecompressionStream');
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+const isWasm = (b) => b && b.length > 1024 && b[0] === 0x00 && b[1] === 0x61 && b[2] === 0x73 && b[3] === 0x6d;
+
+async function wasmBytes() {
+  try {
+    const raw = await gunzip(await downloadBytes(WASM_GZ_URL));
+    if (isWasm(raw)) return raw;
+    throw new Error('decompressed core is not wasm');
+  } catch {
+    // precompressed copy unavailable or could not be unpacked — raw fallback
+    const raw = await downloadBytes(WASM_RAW_URL, true);
+    if (!isWasm(raw)) throw new Error('encoder download is corrupt');
+    return raw;
+  }
 }
 
 export function ffmpeg() {
@@ -134,7 +156,7 @@ export function ffmpeg() {
       await loadScript('/assets/ffmpeg/ffmpeg.js');
       const { FFmpeg } = window.FFmpegWASM;
       const ff = new FFmpeg();
-      const wasmURL = await wasmBlobURL();
+      const wasmURL = URL.createObjectURL(new Blob([await wasmBytes()], { type: 'application/wasm' }));
       await ff.load({
         coreURL: '/assets/ffmpeg/ffmpeg-core.js',
         wasmURL,
@@ -143,7 +165,7 @@ export function ffmpeg() {
       return ff;
     })();
     // A stalled fetch must never hang the job: race the load against a hard
-    // deadline (first visit downloads ~10-33 MB) and drop the cached promise
+    // deadline (first visit downloads ~10 MB) and drop the cached promise
     // on timeout so the next attempt starts clean.
     return await Promise.race([
       load,

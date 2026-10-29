@@ -40,9 +40,15 @@ jobs:
 
       # Dot-prefixed name: .htaccess denies every dotfile, so the archive can
       # never be downloaded even while it sits in public_html.
+      # The precompressed encoder core is generated here (not committed): the
+      # server does not gzip .wasm, and the page fetches the .gz copy — 10 MB
+      # instead of 33 MB on the wire. media.js falls back to the raw file if
+      # this copy is ever missing.
       - name: Package public_html
         run: |
           cd webhosting/public_html
+          gzip -9 -c assets/ffmpeg/ffmpeg-core.wasm > assets/ffmpeg/ffmpeg-core.wasm.gz
+          ls -la assets/ffmpeg/
           zip -qr "$RUNNER_TEMP/.deploy-$(date -u +%Y%m%d_%H%M%S).zip" .
           ls -la "$RUNNER_TEMP"/.deploy-*.zip
 

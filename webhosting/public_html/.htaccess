@@ -23,6 +23,9 @@
   RewriteRule \.(env|md|log|json)$ - [R=404,L]
   # Deployment archives are uploaded into public_html before extraction —
   # they must never be downloadable, because they bundle the .env.
+  # Exception: the precompressed encoder core under /assets/ffmpeg/ is a
+  # normal static file the page downloads on purpose.
+  RewriteCond %{REQUEST_URI} !^/assets/ffmpeg/
   RewriteRule \.(zip|tar|gz|tgz|7z|rar|sql|bak)$ - [R=404,L]
 </IfModule>
 
@@ -36,7 +39,7 @@
   # The ffmpeg core is a 33 MB wasm — every re-download costs the visitor
   # minutes on a slow link. Keep it for 30 days; when the core itself is
   # replaced, the code bumps the ?v= query so a fresh copy is fetched.
-  <FilesMatch "\.wasm$">
+  <FilesMatch "\.wasm(\.gz)?$">
     Header set Cache-Control "public, max-age=2592000"
   </FilesMatch>
 </IfModule>

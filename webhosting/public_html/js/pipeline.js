@@ -269,6 +269,7 @@ export async function runJob(params, emit) {
           videoBlob: src.blob, audioBlob: null, startSec: seg.startSec,
           span: seg.endSec - seg.startSec, aspect,
           onProgress: (p) => stageUp('cutting', 84 + ((i + p / 100) / segments.length) * 12, `Encoding clip ${i + 1} (${p}%)`),
+          onLog: (line) => log(`⚙ ffmpeg: ${line}`),
         });
         const name = `clip_${String(i + 1).padStart(2, '0')}.mp4`;
         const up = await api.uploadClip(job.id, name, blob);

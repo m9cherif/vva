@@ -142,6 +142,7 @@ async function downloadBytes(url, { retries = 4, stallSec = 15 } = {}) {
         if (p >= last + 10) { last = p; emitLoad(p); }
       }
       clearTimeout(stallTimer);
+      emitLoad(100);
       break;                                                          // complete
     } catch (err) {
       if (attempt === retries) throw new Error(`download stalled repeatedly (${String(err.name || err)})`);
@@ -222,13 +223,16 @@ export function aspectFilter(aspect) {
  * Cut [startSec, startSec+span] from downloaded video/audio blobs into an mp4.
  * @returns {Promise<Blob>}
  */
-export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '16:9', onProgress = () => {} }) {
+export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '16:9', onProgress = () => {}, onLog = () => {} }) {
   const ff = await ffmpeg();
   const files = [];
   let lastBeat = Date.now();
+  let lastLog = 0;
   const beat = () => { lastBeat = Date.now(); };
-  /* Stall watchdog: if ffmpeg reports nothing for 45 s the encode is dead
-   * (worker died, socket wedged) — fail the clip instead of hanging forever. */
+  /* Stall watchdog: if ffmpeg reports nothing (progress OR log lines) for 45 s
+   * the encode is dead (worker died, wasm crashed) — fail the clip instead of
+   * hanging forever. A healthy-but-slow encode streams log lines constantly,
+   * so big 1080p clips never trip this. */
   let timer = null;
   const watchdog = new Promise((_, rej) => {
     timer = setInterval(() => {
@@ -239,14 +243,17 @@ export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '
   });
 
   const run = async () => {
+    beat();
     await ff.writeFile('in.mp4', new Uint8Array(await videoBlob.arrayBuffer()));
     files.push('in.mp4');
+    beat();
     let inputs = ['-ss', startSec.toFixed(2), '-i', 'in.mp4'];
     if (audioBlob && audioBlob.size > 1024) {
       await ff.writeFile('in_audio.mp4', new Uint8Array(await audioBlob.arrayBuffer()));
       files.push('in_audio.mp4');
       inputs = ['-ss', startSec.toFixed(2), '-i', 'in.mp4', '-ss', startSec.toFixed(2), '-i', 'in_audio.mp4',
                 '-map', '0:v:0', '-map', '1:a:0'];
+      beat();
     }
     const vf = aspectFilter(aspect);
     const args = [...inputs, '-t', span.toFixed(2)];
@@ -256,7 +263,13 @@ export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '
               '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero', '-y', 'out.mp4');
 
     const onProg = ({ progress }) => { beat(); if (typeof progress === 'number') onProgress(Math.min(100, Math.round(progress * 100))); };
+    const onLine = (e) => {
+      beat();
+      const text = String((e && (e.message || e)) || '').trim();
+      if (text && Date.now() - lastLog > 8_000) { lastLog = Date.now(); onLog(text.slice(0, 160)); }
+    };
     ff.on('progress', onProg);
+    ff.on('log', onLine);
     try {
       beat();
       await ff.exec(args);
@@ -266,6 +279,7 @@ export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '
       return new Blob([data.buffer], { type: 'video/mp4' });
     } finally {
       ff.off('progress', onProg);
+      ff.off('log', onLine);
     }
   };
 

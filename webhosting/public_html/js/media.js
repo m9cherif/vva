@@ -102,25 +102,53 @@ const loadListeners = new Set();
 export function onFfmpegLoad(cb) { loadListeners.add(cb); return () => loadListeners.delete(cb); }
 const emitLoad = (p) => { for (const cb of loadListeners) { try { cb(p); } catch { /* listener bug */ } } };
 
-async function downloadBytes(url, fromZero = false) {
-  const res = await fetch(url, { cache: 'force-cache' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const declared = Number(res.headers.get('content-length')) || 1;
-  if (!res.body) {
-    emitLoad(100);
-    return new Uint8Array(await res.arrayBuffer());
-  }
-  if (fromZero) emitLoad(0);
-  const reader = res.body.getReader();
+async function downloadBytes(url, { retries = 4, stallSec = 15 } = {}) {
+  /* Slow links stall for minutes: watch for byte silence, abort, and resume
+   * with a Range request (the host serves static files with Accept-Ranges).
+   * Every attempt continues where the last one stopped. */
   const chunks = [];
-  let got = 0, last = -1;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    got += value.length;
-    const p = Math.min(99, Math.round((got / declared) * 100));
-    if (p >= last + 10) { last = p; emitLoad(p); }
+  let got = 0, total = 0, last = -1;
+  let res = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const ctl = new AbortController();
+    let stallTimer = setTimeout(() => ctl.abort(), stallSec * 1000);
+    const beat = () => { clearTimeout(stallTimer); stallTimer = setTimeout(() => ctl.abort(), stallSec * 1000); };
+    try {
+      const headers = got > 0 ? { Range: `bytes=${got}-` } : {};
+      res = await fetch(url, { cache: 'force-cache', headers, signal: ctl.signal });
+      if (res.status === 416) {                                        // past EOF: have it all
+        if (total && got >= total) break;
+        throw new Error('HTTP 416');
+      }
+      if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
+      if (res.status === 200) { chunks.length = 0; got = 0; }        // Range ignored: restart
+      const cr = res.headers.get('content-range') || '';
+      const m = /\/(\d+)\s*$/.exec(cr);
+      total = m ? Number(m[1]) : got + (Number(res.headers.get('content-length')) || 0);
+      if (!res.body) {
+        const buf = new Uint8Array(await res.arrayBuffer());
+        emitLoad(100);
+        return buf;
+      }
+      const reader = res.body.getReader();
+      if (got === 0) emitLoad(0);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        beat();
+        chunks.push(value);
+        got += value.length;
+        const p = Math.min(99, Math.round((got / Math.max(total, 1)) * 100));
+        if (p >= last + 10) { last = p; emitLoad(p); }
+      }
+      clearTimeout(stallTimer);
+      break;                                                          // complete
+    } catch (err) {
+      if (attempt === retries) throw new Error(`download stalled repeatedly (${String(err.name || err)})`);
+      emitLoad(Math.min(99, Math.round((got / Math.max(total, 1)) * 100)));  // resume from here
+    } finally {
+      clearTimeout(stallTimer);
+    }
   }
   const out = new Uint8Array(got);
   let off = 0;
@@ -143,7 +171,7 @@ async function wasmBytes() {
     throw new Error('decompressed core is not wasm');
   } catch {
     // precompressed copy unavailable or could not be unpacked — raw fallback
-    const raw = await downloadBytes(WASM_RAW_URL, true);
+    const raw = await downloadBytes(WASM_RAW_URL);
     if (!isWasm(raw)) throw new Error('encoder download is corrupt');
     return raw;
   }
@@ -165,11 +193,11 @@ export function ffmpeg() {
       return ff;
     })();
     // A stalled fetch must never hang the job: race the load against a hard
-    // deadline (first visit downloads ~10 MB) and drop the cached promise
-    // on timeout so the next attempt starts clean.
+    // deadline (first visit downloads ~10 MB, resuming across stalls) and
+    // drop the cached promise on timeout so the next attempt starts clean.
     return await Promise.race([
       load,
-      delay(180_000, 'video encoder did not finish loading within 180s (network stall) — retrying on the next clip'),
+      delay(300_000, 'video encoder did not finish loading within 5 minutes (network stall) — retrying on the next clip'),
     ]);
   })().catch((e) => { ffPromise = null; throw e; });
   return ffPromise;

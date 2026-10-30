@@ -89,8 +89,9 @@ export async function generateCopy(segments) {
 
 /* ── ffmpeg.wasm ────────────────────────────────────────────────────────── */
 let ffPromise = null;
-const WASM_GZ_URL = '/assets/ffmpeg/ffmpeg-core.wasm.gz?v=build1';
-const WASM_RAW_URL = '/assets/ffmpeg/ffmpeg-core.wasm?v=build1';
+const WASM_GZ_URL = '/assets/ffmpeg/ffmpeg-core.wasm.gz?v=build2';
+const WASM_RAW_URL = '/assets/ffmpeg/ffmpeg-core.wasm?v=build2';
+const CORE_JS_URL = '/assets/ffmpeg/ffmpeg-core.js?v=build2';
 const delay = (ms, msg) => new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms));
 
 /* The core is a 33 MB wasm and the server does not gzip it. CI publishes a
@@ -180,19 +181,16 @@ async function wasmBytes() {
   }
 }
 
-/* The encoder spawns its worker threads on demand (at the first real encode):
- * each one fetches the core worker script over the network and then
- * importScripts()es the core JS. On a stalled link those tiny fetches hang for
- * minutes and the encode freezes at frame 1 waiting for threads that never
- * start. Both files are therefore downloaded here through the same resumable
- * downloader and handed to ffmpeg as blob URLs — with the wasm blob that
- * makes the whole encode network-free. */
-const CORE_JS_URL = '/assets/ffmpeg/ffmpeg-core.js?v=build1';
-const CORE_WORKER_URL = '/assets/ffmpeg/ffmpeg-core.worker.js?v=build1';
+/* The core JS (112 KB) is fetched through the same resumable downloader and
+ * handed to ffmpeg as a blob URL, so the runtime loads with zero network
+ * inside the class worker (the wasm arrives the same way below).
+ *
+ * Single-threaded core on purpose (@ffmpeg/core, the official default):
+ * the multithreaded build was vendored first and it fails in real browsers —
+ * it deadlocks at the first encode (worker threads never run) and its fixed
+ * 1 GB non-growable shared memory corrupts on real video decoding. The ST
+ * core needs no SharedArrayBuffer, no worker script and no isolation. */
 let coreJSBlobURL = null;
-let coreWorkerBlobURL = null;
-const assetBlobURL = async (url) =>
-  URL.createObjectURL(new Blob([await downloadBytes(url, { silent: true })], { type: 'text/javascript' }));
 
 export function ffmpeg() {
   if (!ffPromise) ffPromise = (async () => {
@@ -204,14 +202,13 @@ export function ffmpeg() {
       const wasmURL = URL.createObjectURL(new Blob([await wasmBytes()], { type: 'application/wasm' }));
       if (!coreJSBlobURL) {
         try {
-          coreJSBlobURL = await assetBlobURL(CORE_JS_URL);
-          coreWorkerBlobURL = await assetBlobURL(CORE_WORKER_URL);
-        } catch { /* fall back to plain URLs — the workers then fetch them */ }
+          coreJSBlobURL = URL.createObjectURL(
+            new Blob([await downloadBytes(CORE_JS_URL, { silent: true })], { type: 'text/javascript' }));
+        } catch { /* fall back to the plain URL — the class worker then fetches it */ }
       }
       await ff.load({
         coreURL: coreJSBlobURL || CORE_JS_URL,
         wasmURL,
-        workerURL: coreWorkerBlobURL || CORE_WORKER_URL,
       });
       return ff;
     })();
@@ -278,12 +275,11 @@ export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '
       beat();
     }
     const vf = aspectFilter(aspect);
-    /* Threads pinned to 1 on purpose: this multithreaded core deadlocks in
-     * some browsers the instant libx264 or a filter spawns a worker thread —
-     * the encode froze at frame 1 forever with zero network activity left to
-     * blame (verified in-page: the same core encodes reliably with threads=1).
-     * Single-threaded wasm x264 is still fast enough for short clips, and the
-     * stall watchdog above is the safety net for anything unexpected. */
+    /* Threads pinned to 1 explicitly: the vendored core is single-threaded,
+     * and these flags keep every part of the graph (decoder, filters, x264)
+     * from ever requesting threads regardless of build — the multithreaded
+     * core deadlocked at frame 1 in real browsers. The stall watchdog above
+     * is the safety net for anything unexpected. */
     const args = ['-threads', '1', '-filter_threads', '1', ...inputs, '-t', span.toFixed(2)];
     if (vf) args.push('-vf', vf);
     args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',

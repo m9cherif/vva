@@ -67,9 +67,11 @@ function cfg(): array {
         'dataDir'   => $root . '/data',
         'cacheDir'  => $root . '/data/cache',
         'jobsDir'   => $root . '/data/jobs',
-        // Free-forever direct-MP4 source (https://www.pexels.com/api/).
-        // Empty until the key is added — the app then stays on YouTube.
-        'pexelsKey' => trim((string) env_get('PEXELS_API_KEY', '')),
+        // VidKraken (https://vidkraken.com/) — the ONLY download source: a
+        // YouTube-by-URL API that hands back a ready-made trimmed MP4.
+        // The key lives in .env (CI regenerates it from a repo secret) and
+        // never reaches the browser: api/vidkraken.php holds it server-side.
+        'vidkrakenKey' => trim((string) env_get('VIDKRAKEN_API_KEY', '')),
     ];
     foreach (['dataDir', 'cacheDir', 'jobsDir'] as $d) {
         if (!is_dir($c[$d])) @mkdir($c[$d], 0775, true);
@@ -83,8 +85,8 @@ function limits(): array {
         'clipLengthMin' => 8, 'clipLengthMax' => 60,
         'sourceMin' => 2, 'sourceMax' => 6,
         'windowMin' => 60, 'windowMax' => 240, 'windowDefault' => 150,
-        'frameIntervalSec' => 6, 'frameWidth' => 384, 'framesPerBatch' => 10,
-        'searchPoolSize' => 30,
+        'frameIntervalSec' => 4, 'frameWidth' => 384, 'framesPerBatch' => 10,
+        'searchPoolSize' => 40,
         'minSourceDurationSec' => 45, 'maxSourceDurationSec' => 900,
         'qualityOptions' => [480, 720], 'qualityDefault' => 720,
         'aspectOptions' => ['16:9', '9:16', '1:1'], 'aspectDefault' => '16:9',
@@ -298,217 +300,61 @@ function parse_views(string $text): int {
 }
 
 /** True only for hosts we are willing to relay bytes from (SSRF guard).
- *  Covers the YouTube CDN, the Pexels CDN and Internet Archive (keyless). */
-function is_youtube_cdn_host(string $host): bool {
+ *  Covers the YouTube CDN (the built-in fallback downloader) and the
+ *  VidKraken media CDN — proxy.vidkraken.com sends no CORS headers, so every
+ *  byte of a VidKraken download has to be relayed same-origin through
+ *  range.php. */
+function is_relay_host(string $host): bool {
     $host = strtolower($host);
-    return $host === 'googlevideo.com' || str_ends_with($host, '.googlevideo.com')
-        || $host === 'ytimg.com' || str_ends_with($host, '.ytimg.com')
-        || $host === 'youtube.com' || str_ends_with($host, '.youtube.com')
-        || $host === 'pexels.com' || str_ends_with($host, '.pexels.com')
-        || $host === 'archive.org' || str_ends_with($host, '.archive.org');
+    foreach (['googlevideo.com', 'ytimg.com', 'youtube.com', 'vidkraken.com'] as $d) {
+        if ($host === $d || str_ends_with($host, '.' . $d)) return true;
+    }
+    return false;
 }
 
-/* ── Internet Archive (free forever, NO key: https://archive.org/developers) ──
- * Progressive faststart MP4s served with real Range support, so the byte-range
- * downloader and the cutting stage work unchanged. Used as the last resort
- * when YouTube blocks the host and no Pexels key is configured. */
-function archive_metadata(string $id): ?array {
+/* ── VidKraken (https://vidkraken.com/) ────────────────────────────────────
+ * The app's one and only download source: POST a YouTube URL, poll the job,
+ * get back a trimmed MP4 on their CDN. The API key lives in .env and is used
+ * exclusively here — the browser talks to api/vidkraken.php, never to them.
+ * Every call is short and bounded: shared hosting must never run a script
+ * that waits on a third party, so the poll loop lives in the browser. */
+const VIDKRAKEN_BASE = 'https://vidkraken.com/api/v2';
+
+/**
+ * Call the VidKraken API. Never throws and never fails the request by itself:
+ * returns ['status' => int, 'data' => ?array, 'error' => ?string] so the
+ * caller decides whether to fall back (status 0 = no key / transport failure).
+ */
+function vidkraken_call(string $method, string $path, ?array $body = null, array $headers = [], int $timeout = 30): array {
+    $key = cfg()['vidkrakenKey'];
+    if ($key === '') return ['status' => 0, 'data' => null, 'error' => 'VIDKRAKEN_API_KEY is not configured'];
+    $auth = ['Authorization: Bearer ' . $key];
     try {
-        $res = http_get_json('https://archive.org/metadata/' . rawurlencode($id), [], 25);
-        if ($res['status'] !== 200) return null;
-        $d = json_decode($res['body'], true);
-        return is_array($d) && !empty($d['server']) ? $d : null;
-    } catch (Throwable) {
-        return null;
+        $res = $method === 'GET'
+            ? http_get_json(VIDKRAKEN_BASE . $path, array_merge($auth, $headers), $timeout)
+            : http_post_json(VIDKRAKEN_BASE . $path, $body ?? [], array_merge($auth, $headers), $timeout, 12);
+    } catch (Throwable $e) {
+        return ['status' => 0, 'data' => null, 'error' => $e->getMessage()];
     }
-}
-
-/** Fetch many item metadata records at once (parallel — search stays fast). */
-function archive_metadata_bulk(array $ids, int $max = 24): array {
-    $ids = array_slice(array_values(array_unique($ids)), 0, $max);
-    $out = [];
-    if (!function_exists('curl_multi_init')) {
-        foreach ($ids as $id) { $m = archive_metadata($id); if ($m) $out[$id] = $m; }
-        return $out;
-    }
-    $mh = curl_multi_init();
-    $handles = [];
-    foreach ($ids as $id) {
-        $ch = curl_init('https://archive.org/metadata/' . rawurlencode($id));
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_TIMEOUT => 25, CURLOPT_CONNECTTIMEOUT => 8, CURLOPT_USERAGENT => UA_BROWSER,
-        ]);
-        curl_multi_add_handle($mh, $ch);
-        $handles[$id] = $ch;
-    }
-    do {
-        $status = curl_multi_exec($mh, $active);
-        if ($active) curl_multi_select($mh, 1.0);
-    } while ($active && $status === CURLM_OK);
-    foreach ($handles as $id => $ch) {
-        $body = (string) curl_multi_getcontent($ch);
-        if ((int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE) === 200 && $body !== '') {
-            $j = json_decode($body, true);
-            if (is_array($j) && !empty($j['server'])) $out[$id] = $j;
+    $data = json_decode($res['body'], true);
+    $err = null;
+    if ($res['status'] < 200 || $res['status'] >= 300) {
+        $msg = null;
+        if (is_array($data)) $msg = $data['error'] ?? $data['message'] ?? null;
+        if (is_array($msg)) $msg = json_encode($msg);
+        if (!is_string($msg) || $msg === '') {
+            $msg = 'VidKraken HTTP ' . $res['status'] . ': '
+                 . mb_substr(preg_replace('/\s+/', ' ', (string) $res['body']), 0, 200);
         }
-        curl_multi_remove_handle($mh, $ch);
-        curl_close($ch);
+        if (is_array($data) && !empty($data['code'])) $msg .= ' [' . $data['code'] . ']';
+        $err = $msg;
     }
-    curl_multi_close($mh);
-    return $out;
+    return ['status' => $res['status'], 'data' => is_array($data) ? $data : null, 'error' => $err];
 }
 
-/** "34:56" | "1:02:03" | "1234.56" → seconds. */
-function archive_parse_length(string $raw): int {
-    $raw = trim($raw);
-    if ($raw === '') return 0;
-    if (preg_match('/^(\d+):(\d{2})(?::(\d{2}))?$/', $raw, $m)) {
-        return isset($m[3]) ? (int) $m[1] * 3600 + (int) $m[2] * 60 + (int) $m[3]
-                            : (int) $m[1] * 60 + (int) $m[2];
-    }
-    return (int) floor((float) $raw);
-}
-
-/** Every mp4 derivative of an item, best first: real dimensions, then size. */
-function archive_mp4_files(array $meta): array {
-    $out = [];
-    foreach (($meta['files'] ?? []) as $f) {
-        if (!is_array($f)) continue;
-        $name = (string) ($f['name'] ?? '');
-        if (!preg_match('/\.mp4$/i', $name)) continue;
-        $size = (int) ($f['size'] ?? 0);
-        $w = (int) ($f['width'] ?? 0);
-        $out[] = [
-            'score' => $w * 1000 + min($size, 3_000_000_000) / 1e6,
-            'name' => $name, 'size' => $size,
-            'width' => $w, 'height' => (int) ($f['height'] ?? 0),
-            'length' => (string) ($f['length'] ?? ''), 'format' => (string) ($f['format'] ?? ''),
-        ];
-    }
-    usort($out, fn($a, $b) => $b['score'] <=> $a['score']);
-    return $out;
-}
-
-/** Best mp4 derivative of an item: prefer real dimensions, then file size. */
-function archive_best_mp4(array $meta): ?array {
-    $all = archive_mp4_files($meta);
-    return $all ? $all[0] : null;
-}
-
-function archive_file_url(array $meta, string $name): string {
-    $server = rtrim((string) ($meta['server'] ?? 'archive.org'), '/');
-    if (!preg_match('#^https?://#i', $server)) $server = 'https://' . ltrim($server, '/');
-    $dir = trim((string) ($meta['dir'] ?? ''), '/');
-    $path = implode('/', array_map('rawurlencode', explode('/', $name)));
-    return "{$server}/{$dir}/{$path}";
-}
-
-/** Range-probe many file URLs in parallel → [url => ['ok' => bool, 'faststart' => bool]].
- *  Two things kill a candidate before the AI ever sees it: archive.org lists
- *  files that are not downloadable (HTTP 403), and files whose `moov` atom
- *  sits at the END — those cannot be decoded from the downloaded prefix, so
- *  frame sampling would fail. The probe reads the same first 256 KB the
- *  downloader fetches and checks for `moov` in it. */
-function archive_probe_urls(array $urls, int $timeout = 15, int $bytes = 262144): array {
-    $urls = array_values(array_unique($urls));
-    $out = [];
-    foreach ($urls as $u) $out[$u] = ['ok' => false, 'faststart' => false];
-    if (!$urls || !function_exists('curl_multi_init')) return $out;
-    $mh = curl_multi_init();
-    $handles = [];
-    foreach ($urls as $u) {
-        $ch = curl_init($u);
-        curl_setopt_array($ch, [
-            CURLOPT_HTTPHEADER => ['Range: bytes=0-' . ($bytes - 1)],
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 3,
-            CURLOPT_TIMEOUT => $timeout,
-            CURLOPT_CONNECTTIMEOUT => 6,
-            CURLOPT_USERAGENT => UA_BROWSER,
-        ]);
-        curl_multi_add_handle($mh, $ch);
-        $handles[$u] = $ch;
-    }
-    do {
-        $status = curl_multi_exec($mh, $active);
-        if ($active) curl_multi_select($mh, 1.0);
-    } while ($active && $status === CURLM_OK);
-    foreach ($handles as $u => $ch) {
-        $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        $body = (string) curl_multi_getcontent($ch);
-        $ok = ($code === 206 || $code === 200) && $body !== '';
-        $out[$u] = ['ok' => $ok, 'faststart' => $ok && str_contains(substr($body, 0, $bytes), 'moov')];
-        curl_multi_remove_handle($mh, $ch);
-        curl_close($ch);
-    }
-    curl_multi_close($mh);
-    return $out;
-}
-
-/** Normalize an archive item into the shape the research agent expects. */
-function archive_normalize(array $meta, array $doc, string $query): ?array {
-    $file = archive_best_mp4($meta);
-    if (!$file) return null;
-    $id = (string) ($doc['identifier'] ?? $meta['metadata']['identifier'] ?? '');
-    if ($id === '') return null;
-    $dur = archive_parse_length($file['length']);
-    if ($dur < limits()['minSourceDurationSec'] || $dur > 3600) return null;
-    $title = trim((string) ($doc['title'] ?? $meta['metadata']['title'] ?? ''));
-    if (is_array($title)) $title = trim((string) ($title[0] ?? ''));
-    if ($title === '') $title = $query;
-    $creator = trim((string) (($meta['metadata']['creator'] ?? '') ?: ($meta['metadata']['sponsor'] ?? '')));
-    if (is_array($creator)) $creator = trim((string) ($creator[0] ?? ''));
-    return [
-        'id' => $id,
-        'title' => mb_substr($title, 0, 90),
-        'channel' => $creator !== '' ? $creator : 'Internet Archive',
-        'duration' => $dur,
-        'views' => (int) ($doc['downloads'] ?? 0),
-        'thumb' => "https://archive.org/services/img/{$id}",
-        'live' => false,
-        'provider' => 'archive',
-        'page' => "https://archive.org/details/{$id}",
-        'file' => $file['name'],
-    ];
-}
-/* ── Pexels source (free forever: https://www.pexels.com/api/) ──────────────
- * Direct progressive MP4 files — used when it is configured, ahead of the
- * Internet Archive fallback. */
-function pexels_available(): bool {
-    return cfg()['pexelsKey'] !== '';
-}
-
-function pexels_api(string $pathAndQuery): array {
-    if (!pexels_available()) fail('PEXELS_API_KEY is not set in .env — add the free key from pexels.com/api to use this source', 400);
-    $res = http_get_json('https://api.pexels.com' . $pathAndQuery, ['Authorization: ' . cfg()['pexelsKey']], 30);
-    if ($res['status'] !== 200) {
-        fail('Pexels API returned HTTP ' . $res['status'] . ': ' . mb_substr(preg_replace('/\s+/', ' ', $res['body']), 0, 180), 502);
-    }
-    $d = json_decode($res['body'], true);
-    if (!is_array($d)) fail('Pexels API returned malformed data', 502);
-    return $d;
-}
-
-/** Normalize a Pexels video object into the shape the research agent expects. */
-function pexels_normalize(array $v, string $query): ?array {
-    $dur = (int) ($v['duration'] ?? 0);
-    if ($dur < limits()['minSourceDurationSec'] || $dur > limits()['maxSourceDurationSec']) return null;
-    $id = (string) ($v['id'] ?? '');
-    if ($id === '') return null;
-    $who = (string) ($v['user']['name'] ?? '');
-    $photos = $v['video_pictures'] ?? [];
-    $cover = (string) ($photos[0]['picture'] ?? $v['image'] ?? '');
-    return [
-        'id' => $id,
-        'title' => trim(($query !== '' ? $query : 'Stock footage') . ($who !== '' ? " — {$who}" : '')),
-        'channel' => $who !== '' ? $who : 'Pexels',
-        'duration' => $dur,
-        'views' => 0,
-        'thumb' => $cover,
-        'live' => false,
-        'provider' => 'pexels',
-        'page' => (string) ($v['url'] ?? ''),
-    ];
+/** Free quota probe (GET /me) → downloads left on the plan, or null if unknown. */
+function vidkraken_downloads_left(): ?int {
+    $r = vidkraken_call('GET', '/me', null, [], 20);
+    $rem = $r['data']['balances']['download_count']['remaining'] ?? null;
+    return is_numeric($rem) ? (int) $rem : null;
 }

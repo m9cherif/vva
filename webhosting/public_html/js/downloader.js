@@ -1,15 +1,23 @@
-/* Chunked byte-range downloader.
+/* Footage acquisition — VidKraken first, built-in downloader as fallback.
  *
- * Pulls [0, endByte) of a YouTube stream through api/range.php in bounded
- * pieces: every request is short (shared hosting kills long ones), has an
- * abort timeout, and retries with backoff. Returns one Blob.
+ * VidKraken (https://vidkraken.com/) is a YouTube download-by-URL API: we POST
+ * a video id + a time window, poll the job, and pull a ready-made trimmed MP4
+ * back from their CDN. Their CDN sends no CORS headers, so every byte travels
+ * same-origin through api/range.php in bounded 4 MB pieces (shared hosting
+ * kills long requests).
+ *
+ * If VidKraken fails for a video — quota gone, job failed, network — the SAME
+ * already-chosen video is fetched through the built-in Innertube + range path.
+ * The research agent never re-chooses anything: only the transport changes.
  */
-import { api, b64url } from './api.js?v=build1';
-import { planPrefix } from './mp4.js?v=build1';
+import { api, b64url } from './api.js?v=build3';
+import { planPrefix } from './mp4.js?v=build3';
 
 const HEADER_BYTES = 262_144;          // 256 KB is plenty for ftyp+moov+sidx
 const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request
 const MAX_ATTEMPTS = 3;
+const POLL_MS = 1500;                  // VidKraken jobs finish in ~8-30 s
+const JOB_DEADLINE_MS = 180_000;       // never poll a job forever
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -44,8 +52,128 @@ async function fetchChunk(url, from, to, onRetry) {
   throw lastErr || new Error('download failed');
 }
 
+/** Pull a whole file of known size through the relay, with progress. */
+async function pullFile(url, total, onProgress = () => {}) {
+  const parts = [];
+  let offset = 0;
+  while (offset < total) {
+    const to = Math.min(total - 1, offset + CHUNK_BYTES - 1);
+    const chunk = await fetchChunk(url, offset, to, (attempt) => {
+      onProgress(Math.min(99, Math.round((offset / total) * 100)));
+      void attempt;
+    });
+    parts.push(chunk);
+    offset += chunk.byteLength;
+    onProgress(Math.min(99, Math.round((offset / total) * 100)));
+    if (chunk.byteLength < to - offset + 1 + 1 && offset < total) break; // upstream sent less than asked
+  }
+  if (offset < total) throw new Error(`incomplete download (${offset} of ${total} bytes)`);
+  onProgress(100);
+  return new Blob(parts, { type: 'video/mp4' });
+}
+
+/** Mark an error as "worth another attempt" so the caller can decide. */
+function vkError(message, retryable) {
+  const e = new Error(message);
+  e.retryable = Boolean(retryable);
+  return e;
+}
+
 /**
- * Download the prefix of a stream covering [0, windowSec].
+ * VidKraken path: submit a trimmed job → poll → pull the bytes.
+ *
+ * @param {{id: string, windowSec: number, format?: string}} job
+ * @param {(pct: number, note?: string) => void} onProgress
+ * @returns {Promise<{blob: Blob, bytes: number, method: string, coveredSec: number, height: number}>}
+ */
+export async function downloadVidkraken({ id, windowSec, format = '480' }, onProgress = () => {}) {
+  const started = await api.vk({
+    action: 'start', id, startSec: 0, endSec: Math.round(windowSec), format,
+  });
+  if (!started.jobId) throw vkError(started.error || 'VidKraken did not return a job id', true);
+
+  const t0 = Date.now();
+  let note = '';
+  for (;;) {
+    if (Date.now() - t0 > JOB_DEADLINE_MS) {
+      throw vkError('VidKraken job timed out after 3 minutes', true);
+    }
+    await sleep(POLL_MS);
+    let s;
+    try {
+      s = await api.vk({ action: 'status', jobId: started.jobId });
+    } catch (err) {
+      // A lost poll must not kill the job: it is still running server-side.
+      note = `poll failed (${String(err.message || err).slice(0, 60)}) — retrying`;
+      onProgress(0, note);
+      continue;
+    }
+
+    if (s.status === 'COMPLETED') {
+      if (!s.fileSize || !s.downloadUrl) throw vkError('VidKraken completed without a file', true);
+      const blob = await pullFile(s.downloadUrl, s.fileSize, (p) => onProgress(p, 'downloading'));
+      return {
+        blob,
+        bytes: blob.size,
+        method: 'vidkraken',
+        coveredSec: Math.min(Math.round(s.duration || windowSec), Math.round(windowSec)),
+        // VidKraken may deliver a lower resolution than requested (a 480 ask on
+        // a 240p source returns 240). The cut stage only needs to know that.
+        height: Number(s.actualFormat) || Number(format) || 480,
+      };
+    }
+
+    if (s.status === 'FAILED' || s.status === 'NETWORK_ERROR') {
+      const msg = (s.error || s.code || s.status).slice(0, 160);
+      throw vkError(`VidKraken: ${msg}`, s.retryable !== false);
+    }
+
+    const pct = Number(s.percent) || 0;
+    const next = `${s.status.toLowerCase()}${s.stage ? ` ${s.stage}` : ''}${pct ? ` ${pct}%` : ''}`;
+    if (next !== note) { note = next; onProgress(0, note); }
+  }
+}
+
+/**
+ * Built-in fallback for the SAME video: resolve an Innertube stream and pull
+ * the byte prefix covering the window (mp4.js plans the exact range).
+ */
+export async function downloadFallback(video, { windowSec, quality = 480 }, onProgress = () => {}) {
+  const info = await api.player(video.id, 'youtube');
+  const videos = info.streams.filter((s) => s.kind === 'video' && s.mimeType.includes('mp4'));
+  const best = videos.filter((s) => s.height <= quality).sort((a, b) => b.height - a.height)[0]
+             || videos.sort((a, b) => a.height - b.height)[0];
+  if (!best) throw new Error('no compatible video stream');
+  const dl = await downloadPrefix({ ...best, durationSec: info.duration || video.duration || windowSec },
+    windowSec, onProgress);
+  return { ...dl, method: 'innertube', height: best.height, coveredSec: dl.coveredSec };
+}
+
+/**
+ * Acquire one source video: VidKraken when it is available, otherwise (or
+ * after it fails) the built-in downloader — always the same video.
+ *
+ * @param {{id: string, duration?: number}} video
+ * @param {{windowSec: number, format?: string, quality?: number, useVidkraken?: boolean}} opts
+ * @param {{onProgress?: Function, onFallback?: Function}} hooks
+ */
+export async function acquireFootage(video, opts, hooks = {}) {
+  const onProgress = hooks.onProgress || (() => {});
+  if (opts.useVidkraken !== false) {
+    try {
+      return await downloadVidkraken(
+        { id: video.id, windowSec: opts.windowSec, format: opts.format },
+        onProgress,
+      );
+    } catch (err) {
+      hooks.onFallback?.(err);
+    }
+  }
+  return downloadFallback(video, { windowSec: opts.windowSec, quality: opts.quality }, onProgress);
+}
+
+/**
+ * Download the prefix of a stream covering [0, windowSec] — the fallback path.
  *
  * @param {{url: string, contentLength?: number, durationSec: number}} stream
  * @param {number} windowSec

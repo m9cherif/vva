@@ -13,98 +13,12 @@ $in = json_in();
 $id = trim((string) ($in['id'] ?? ''));
 $provider = strtolower((string) ($in['provider'] ?? 'youtube'));
 
-/* ── Pexels: direct progressive MP4 files, no signing, no bot check ─────── */
-if ($provider === 'pexels') {
-    if (!preg_match('/^\d{1,12}$/', $id)) fail('invalid video id');
-    try {
-        $d = pexels_api('/videos/videos/' . rawurlencode($id));
-        $files = [];
-        foreach (($d['video_files'] ?? []) as $f) {
-            if (!is_array($f) || empty($f['link'])) continue;
-            if (($f['file_type'] ?? '') !== 'video/mp4') continue;
-            $files[] = [
-                'itag' => 0,
-                'kind' => 'video',
-                'url' => (string) $f['link'],
-                'mimeType' => 'video/mp4',
-                'width' => (int) ($f['width'] ?? 0),
-                'height' => (int) ($f['height'] ?? 0),
-                'fps' => 0, 'bitrate' => 0,
-                'contentLength' => 0,      // probed on demand by range.php
-                'audioQuality' => '',
-            ];
-        }
-        if (!$files) fail('no downloadable mp4 files for this video', 409);
-        usort($files, fn($a, $b) => $b['height'] <=> $a['height']);
-        json_out([
-            'id' => $id,
-            'provider' => 'pexels',
-            'duration' => (int) ($d['duration'] ?? 0),
-            'title' => trim(($d['title'] ?? '') ?: ('Pexels video ' . $id)),
-            'channel' => (string) ($d['user']['name'] ?? 'Pexels'),
-            'views' => 0,
-            'streams' => $files,
-        ]);
-    } catch (Throwable $e) {
-        fail('Pexels stream resolution failed: ' . $e->getMessage(), 502);
-    }
-}
-/* ── Internet Archive: item metadata → direct faststart MP4 ─────────────── */
-if ($provider === 'archive') {
-    if (!preg_match('/^[A-Za-z0-9._-]{3,80}$/', $id)) fail('invalid item id');
-    try {
-        $meta = archive_metadata($id);
-        if (!$meta) fail('archive item not found', 404);
-        $candidates = archive_mp4_files($meta);
-        if (!$candidates) fail('this archive item has no mp4 file', 409);
-        // Pick a derivative we have actually read bytes from — archive.org
-        // lists restricted files that answer 403 to every range request.
-        $urls = [];
-        foreach ($candidates as $i => $f) $urls[$i] = archive_file_url($meta, $f['name']);
-        $ok = archive_probe_urls($urls, 15);
-        $file = null;
-        $streamUrl = '';
-        foreach ($candidates as $i => $f) {            // faststart first: the
-            if (!empty($ok[$urls[$i]]['faststart'])) { // browser can decode it
-                $file = $f; $streamUrl = $urls[$i]; break;
-            }
-        }
-        if (!$file) {
-            foreach ($candidates as $i => $f) {
-                if (!empty($ok[$urls[$i]]['ok'])) { $file = $f; $streamUrl = $urls[$i]; break; }
-            }
-        }
-        if (!$file) fail('the mp4 files of this item are not downloadable (HTTP 403)', 409);
-        $md = is_array($meta['metadata'] ?? null) ? $meta['metadata'] : [];
-        $title = (string) ($md['title'] ?? $id);
-        if (is_array($title)) $title = (string) ($title[0] ?? $id);
-        $creator = (string) (($md['creator'] ?? '') ?: 'Internet Archive');
-        if (is_array($creator)) $creator = (string) ($creator[0] ?? 'Internet Archive');
-        json_out([
-            'id' => $id,
-            'provider' => 'archive',
-            'duration' => archive_parse_length($file['length']),
-            'title' => mb_substr($title, 0, 90),
-            'channel' => $creator,
-            'views' => 0,
-            'streams' => [[
-                'itag' => 0,
-                'kind' => 'video',
-                'url' => $streamUrl,
-                'mimeType' => 'video/mp4',
-                'width' => $file['width'],
-                'height' => $file['height'],
-                'fps' => 0, 'bitrate' => 0,
-                'contentLength' => $file['size'],
-                'audioQuality' => '',
-            ]],
-        ]);
-    } catch (Throwable $e) {
-        fail('Archive stream resolution failed: ' . $e->getMessage(), 502);
-    }
-}
+/* Downloads come from VidKraken (api/vidkraken.php). This endpoint survives as
+ * the built-in fallback: when VidKraken fails or the plan runs out of credits,
+ * the SAME already-chosen videos are fetched through YouTube's Innertube
+ * player and relayed by range.php — the research agent never re-chooses. */
+if ($provider !== 'youtube') fail("unknown provider \"{$provider}\" (only youtube is supported)");
 
-if ($provider !== 'youtube') fail("unknown provider \"{$provider}\" (use youtube, pexels or archive)");
 if (!preg_match('/^[A-Za-z0-9_-]{11}$/', $id)) fail('invalid video id');
 
 try {

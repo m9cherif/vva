@@ -3,10 +3,12 @@
  * GET /api/range.php?u=<base64url stream url>[&probe=1]
  *     with optional Range: bytes=a-b request header.
  *
- * Relays a byte range of a YouTube CDN stream to the browser. Two reasons this
- * exists: googlevideo.com sends no CORS headers (the browser may not fetch it
- * directly), and keeping every relay request small means no PHP request ever
- * runs long enough to trip shared-hosting timeouts.
+ * Relays a byte range of a source stream to the browser. Two reasons this
+ * exists: neither googlevideo.com nor proxy.vidkraken.com sends CORS headers
+ * (the browser may not fetch them directly), and keeping every relay request
+ * small means no PHP request ever runs long enough to trip shared-hosting
+ * timeouts. This is the single path every download goes through — VidKraken's
+ * trimmed MP4 first, the built-in YouTube fallback second.
  *
  * probe=1  → 200 + JSON { total, acceptRanges } instead of bytes (cheap way to
  * learn the file size before committing to a download).
@@ -17,7 +19,7 @@ $u = (string) ($_GET['u'] ?? '');
 $url = $u !== '' ? (string) base64_decode(strtr($u, '-_', '+/')) : '';
 if ($url === '' || !preg_match('#^https://#i', $url)) fail('missing stream url');
 $host = parse_url($url, PHP_URL_HOST);
-if (!is_string($host) || !is_youtube_cdn_host($host)) fail('url host not allowed', 403);
+if (!is_string($host) || !is_relay_host($host)) fail('url host not allowed', 403);
 
 $rangeHeader = $_SERVER['HTTP_RANGE'] ?? '';
 if ($rangeHeader !== '' && !preg_match('/^bytes=\d*-\d*$/', $rangeHeader)) {

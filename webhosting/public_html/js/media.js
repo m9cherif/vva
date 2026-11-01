@@ -1,6 +1,6 @@
 /* Browser media engine: frame sampling via <video>+canvas, and clip cutting
- * via ffmpeg.wasm (multithreaded core — the COOP/COEP headers enable it). */
-import { api, extractJson } from './api.js?v=build1';
+ * via ffmpeg.wasm (single-threaded core — the COOP/COEP headers enable it). */
+import { api, extractJson } from './api.js?v=build3';
 
 /* ── frames ─────────────────────────────────────────────────────────────── */
 export async function extractFrames(blob, { intervalSec = 6, width = 384, limitSec = 0, onProgress = () => {} } = {}) {
@@ -233,8 +233,10 @@ function loadScript(src) {
 }
 
 export function aspectFilter(aspect) {
-  if (aspect === '9:16') return "crop=w='2*trunc(min(iw,ih*9/16)/2)':h='2*trunc(ih/2)',scale=1080:1920:flags=lanczos";
-  if (aspect === '1:1') return "crop=w='2*trunc(min(iw,ih)/2)':h='2*trunc(min(iw,ih)/2)',scale=1080:1080:flags=lanczos";
+  /* bicubic, not lanczos: at these sizes the difference is invisible and
+   * lanczos is markedly slower in the wasm build. */
+  if (aspect === '9:16') return "crop=w='2*trunc(min(iw,ih*9/16)/2)':h='2*trunc(ih/2)',scale=1080:1920:flags=bicubic";
+  if (aspect === '1:1') return "crop=w='2*trunc(min(iw,ih)/2)':h='2*trunc(min(iw,ih)/2)',scale=1080:1080:flags=bicubic";
   return null;
 }
 
@@ -282,7 +284,10 @@ export async function cutClip({ videoBlob, audioBlob, startSec, span, aspect = '
      * is the safety net for anything unexpected. */
     const args = ['-threads', '1', '-filter_threads', '1', ...inputs, '-t', span.toFixed(2)];
     if (vf) args.push('-vf', vf);
-    args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+    /* ultrafast + crf 23: the slow presets were the single biggest cost of the
+     * cutting stage and the quality difference at social bitrates is nil. */
+    args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+              '-pix_fmt', 'yuv420p',
               '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
               '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero', '-y', 'out.mp4');
 

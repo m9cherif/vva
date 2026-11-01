@@ -27,11 +27,11 @@ async function request(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT) {
 export const api = {
   categories: () => request('/api/categories.php'),
 
-  search: (query, limit, source = 'youtube') =>
+  search: (query, limit) =>
     request('/api/search.php', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, limit, source }),
+      body: JSON.stringify({ query, limit, source: 'youtube' }),
     }, 60_000),
 
   player: (id, provider = 'youtube') =>
@@ -40,6 +40,15 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, provider }),
     }, 45_000),
+
+  /* VidKraken — the one download source. Holds the API key server-side; the
+   * browser only ever sees { action: quota|start|status } responses. */
+  vk: (payload) =>
+    request('/api/vidkraken.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, payload.action === 'start' ? 60_000 : 35_000),
 
   /* AI calls can legitimately take minutes on a cold vision model. */
   ai: (payload) =>
@@ -50,12 +59,9 @@ export const api = {
     }, 200_000),
 
   /* Cover image, always same-origin (COEP isolation + the agent needs bytes).
-   * Accepts an id string or a full video object ({id, provider, thumb}). */
+   * Accepts an id string or a full video object ({id, thumb}). */
   thumb: (video) => {
     const v = typeof video === 'string' ? { id: video } : (video || {});
-    if (v.provider === 'pexels' || v.provider === 'archive') {
-      return `/api/thumb.php?provider=${encodeURIComponent(v.provider)}&url=${encodeURIComponent(v.thumb || '')}`;
-    }
     return `/api/thumb.php?id=${encodeURIComponent(v.id || '')}`;
   },
 

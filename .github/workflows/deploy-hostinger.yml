@@ -25,17 +25,21 @@ jobs:
       - name: Recreate .env
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          VIDKRAKEN_API_KEY: ${{ secrets.VIDKRAKEN_API_KEY }}
         run: |
           if [ -z "$NVIDIA_API_KEY" ]; then
             echo "::error::Secret NVIDIA_API_KEY is not set on the repository"
             exit 1
           fi
+          if [ -z "$VIDKRAKEN_API_KEY" ]; then
+            echo "::error::Secret VIDKRAKEN_API_KEY is not set on the repository"
+            exit 1
+          fi
           {
             echo "NVIDIA_API_KEY=$NVIDIA_API_KEY"
             echo "NVIDIA_API_BASE=https://integrate.api.nvidia.com/v1"
-            # Optional: enables the Pexels fallback when YouTube blocks the host.
-            if [ -n "$PEXELS_API_KEY" ]; then echo "PEXELS_API_KEY=$PEXELS_API_KEY"; fi
+            # VidKraken is the only download source — the site cannot run without it.
+            echo "VIDKRAKEN_API_KEY=$VIDKRAKEN_API_KEY"
           } > webhosting/public_html/.env
 
       # Dot-prefixed name: .htaccess denies every dotfile, so the archive can
@@ -74,38 +78,55 @@ jobs:
 
           post() { curl -s --max-time 90 -X POST "$1" -H 'Content-Type: application/json' --data "$2"; }
 
-          echo "→ archive source search"
-          search=$(post https://vva.chrif.net/api/search.php '{"query":"funny dog","limit":3,"source":"archive"}') \
-            || fail "archive search request failed"
-          out=$search
-          n=$(jq '.videos | length' <<<"$out" 2>/dev/null || echo 0)
-          [ "${n:-0}" -gt 0 ] || fail "archive search returned no videos: $(head -c 200 <<<"$out")"
-          id=$(jq -r '.videos[0].id' <<<"$out")
-          echo "  $n candidates, first: $id"
+          echo "→ VidKraken wiring (free /me probe — spends no download credit)"
+          out=$(post https://vva.chrif.net/api/vidkraken.php '{"action":"quota"}') \
+            || fail "vidkraken.php request failed"
+          if [ "$(jq -r '.ok' <<<"$out" 2>/dev/null)" != "true" ]; then
+            err=$(jq -r '.error // "unknown"' <<<"$out" 2>/dev/null || echo "$out")
+            case "$err" in
+              *not\ configured*) fail "VIDKRAKEN_API_KEY is not wired into .env: $err" ;;
+              *) echo "::warning::VidKraken unreachable from the server: $err" ;;
+            esac
+          else
+            echo "  plan $(jq -r '.plan' <<<"$out"), $(jq -r '.downloads' <<<"$out") downloads left"
+          fi
 
-          echo "→ stream resolution"
-          out=$(post https://vva.chrif.net/api/player.php "{\"id\":\"$id\",\"provider\":\"archive\"}") \
-            || fail "player request failed"
-          url=$(jq -r '.streams[0].url // empty' <<<"$out")
-          case "$url" in https://*) ;; *) fail "no https stream url: $(head -c 200 <<<"$out")";; esac
-          echo "  stream: $(head -c 90 <<<"$url")…"
+          echo "→ YouTube discovery search"
+          search=$(post https://vva.chrif.net/api/search.php '{"query":"funny dog","limit":3}') \
+            || fail "search request failed"
+          n=$(jq '.videos | length' <<<"$search" 2>/dev/null || echo 0)
+          if [ "${n:-0}" -le 0 ]; then
+            echo "::warning::YouTube search returned nothing from CI egress — skipping the relay test"
+          else
+            id=$(jq -r '.videos[0].id' <<<"$search")
+            echo "  $n candidates, first: $id"
 
-          echo "→ byte relay (range.php)"
-          enc=$(printf '%s' "$url" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-          echo "  u param: $(printf '%s' "$enc" | cut -c1-60)… (${#enc} chars)"
-          code=$(curl -sS -o /tmp/chunk.bin -D /tmp/chunk.h -w '%{http_code}' --max-time 60 \
-            -H 'Range: bytes=0-65535' "https://vva.chrif.net/api/range.php?u=$enc" 2>/tmp/curl.err || true)
-          echo "  curl -> ${code:-000} $(head -c 200 /tmp/curl.err 2>/dev/null)"
-          [ "$code" = "206" ] || fail "range relay returned $code"
-          grep -qi '^content-range: bytes 0-65535/' /tmp/chunk.h || fail "missing Content-Range"
-          head -c 12 /tmp/chunk.bin | grep -q ftyp || fail "first bytes are not an mp4"
-          echo "  206 + Content-Range + ftyp ✓"
+            echo "→ thumbnails"
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+              "https://vva.chrif.net/api/thumb.php?id=$id" || true)
+            [ "$code" = "200" ] || echo "::warning::thumb proxy returned $code"
 
-          echo "→ thumbnails (proxied covers)"
-          thumb=$(jq -r '.videos[0].thumb' <<<"$search")
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
-            "https://vva.chrif.net/api/thumb.php?provider=archive&url=$(printf '%s' "$thumb" | jq -sRr @uri)" || true)
-          [ "$code" = "200" ] || echo "::warning::thumb proxy returned $code"
+            echo "→ stream resolution (the built-in fallback path)"
+            out=$(post https://vva.chrif.net/api/player.php "{\"id\":\"$id\",\"provider\":\"youtube\"}") \
+              || fail "player request failed"
+            url=$(jq -r '[.streams[] | select(.kind == "video" and (.mimeType | contains("mp4")))] | first.url // empty' <<<"$out")
+            if [ -z "$url" ]; then
+              echo "::warning::no mp4 stream (YouTube may be blocking CI egress): $(head -c 200 <<<"$out")"
+            else
+              echo "  stream: $(head -c 90 <<<"$url")…"
+
+              echo "→ byte relay (range.php)"
+              enc=$(printf '%s' "$url" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+              echo "  u param: $(printf '%s' "$enc" | cut -c1-60)… (${#enc} chars)"
+              code=$(curl -sS -o /tmp/chunk.bin -D /tmp/chunk.h -w '%{http_code}' --max-time 60 \
+                -H 'Range: bytes=0-65535' "https://vva.chrif.net/api/range.php?u=$enc" 2>/tmp/curl.err || true)
+              echo "  curl -> ${code:-000} $(head -c 200 /tmp/curl.err 2>/dev/null)"
+              [ "$code" = "206" ] || fail "range relay returned $code"
+              grep -qi '^content-range: bytes 0-65535/' /tmp/chunk.h || fail "missing Content-Range"
+              head -c 12 /tmp/chunk.bin | grep -q ftyp || fail "first bytes are not an mp4"
+              echo "  206 + Content-Range + ftyp ✓"
+            fi
+          fi
 
           echo "→ AI endpoint (non-blocking)"
           code=$(curl -s -o /tmp/ai.json -w '%{http_code}' --max-time 120 -X POST \

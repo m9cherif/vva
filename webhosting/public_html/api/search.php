@@ -14,71 +14,12 @@ if ($query === '') fail('query is required');
 $limit = max(1, min(60, (int) ($in['limit'] ?? limits()['searchPoolSize'])));
 $source = strtolower((string) ($in['source'] ?? 'youtube'));
 
-/* ── Pexels source: direct MP4 stock footage (used when YouTube is blocked) ─ */
-if ($source === 'pexels') {
-    try {
-        $data = pexels_api('/videos/search?query=' . rawurlencode($query)
-            . '&per_page=' . min(80, max(10, $limit * 2)) . '&orientation=landscape');
-        $videos = [];
-        foreach (($data['videos'] ?? []) as $v) {
-            $n = pexels_normalize(is_array($v) ? $v : [], $query);
-            if ($n) $videos[] = $n;
-        }
-        // Pexels has no view counts — rank by duration (more footage to mine).
-        usort($videos, fn($a, $b) => $b['duration'] <=> $a['duration']);
-        json_out(['query' => $query, 'source' => 'pexels', 'videos' => array_slice($videos, 0, $limit)]);
-    } catch (Throwable $e) {
-        fail('Pexels search failed: ' . $e->getMessage(), 502);
-    }
-}
-/* ── Internet Archive: keyless search + faststart MP4 files ─────────────── */
-if ($source === 'archive') {
-    try {
-        $q = rawurlencode(trim($query) . ' AND mediatype:movies');
-        $rows = 40;   // metadata is fetched in parallel; a wide pool matters because
-                      // many archive items have no usable mp4 derivative
-        $res = http_get_json(
-            "https://archive.org/advancedsearch.php?q={$q}&fl%5B%5D=identifier&fl%5B%5D=title"
-            . "&fl%5B%5D=downloads&rows={$rows}&output=json",
-            [], 30
-        );
-        if ($res['status'] !== 200) fail("Archive.org search returned HTTP {$res['status']}", 502);
-        $data = json_decode($res['body'], true);
-        $docs = $data['response']['docs'] ?? [];
-        if (!is_array($docs) || !$docs) json_out(['query' => $query, 'source' => 'archive', 'videos' => []]);
+/* Discovery is YouTube-only: keyless Innertube search, no API key, no yt-dlp.
+ * Finding footage and downloading footage are separate concerns — this
+ * endpoint only ever returns candidates; every byte comes from VidKraken
+ * (api/vidkraken.php) with the built-in downloader as the same-video fallback. */
+if ($source !== 'youtube') fail("unknown source \"{$source}\" (only youtube is supported)");
 
-        $metas = archive_metadata_bulk(array_map(fn($d) => (string) ($d['identifier'] ?? ''), $docs), 45);
-        $videos = [];
-        foreach ($docs as $doc) {
-            $id = (string) ($doc['identifier'] ?? '');
-            if ($id === '' || !isset($metas[$id])) continue;
-            $n = archive_normalize($metas[$id], is_array($doc) ? $doc : [], $query);
-            if ($n) $videos[] = $n;
-        }
-        usort($videos, fn($a, $b) => $b['views'] <=> $a['views']);
-
-        // Prefer files that decode from a prefix (moov up front); fall back to
-        // merely-downloadable ones rather than returning nothing at all.
-        // Only the top of the ranked list is probed — 30 × 256 KB max.
-        $probe = [];
-        foreach (array_slice($videos, 0, 30) as $v) {
-            if (isset($metas[$v['id']])) $probe[$v['id']] = archive_file_url($metas[$v['id']], $v['file']);
-        }
-        $ok = archive_probe_urls($probe, 15);
-        $prefer = array_keys(array_filter($ok, fn($v) => $v['ok'] && $v['faststart']));
-        if (!$prefer) $prefer = array_keys(array_filter($ok, fn($v) => $v['ok']));
-        $videos = array_values(array_filter($videos, fn($v) => in_array($probe[$v['id']] ?? '', $prefer, true)));
-        json_out([
-            'query' => $query, 'source' => 'archive',
-            'videos' => array_slice($videos, 0, $limit),
-            'checked' => count($ok), 'downloadable' => count($prefer),
-        ]);
-    } catch (Throwable $e) {
-        fail('Archive.org search failed: ' . $e->getMessage(), 502);
-    }
-}
-
-if ($source !== 'youtube') fail("unknown source \"{$source}\" (use youtube, pexels or archive)");
 
 try {
     $key = innertube_key();

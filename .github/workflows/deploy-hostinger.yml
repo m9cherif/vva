@@ -129,9 +129,11 @@ jobs:
           fi
 
           echo "→ AI endpoint (non-blocking)"
+          # Reasoning models burn ~20-150 tokens thinking before answering:
+          # maxTokens must give them headroom or the reply comes back empty.
           code=$(curl -s -o /tmp/ai.json -w '%{http_code}' --max-time 120 -X POST \
             https://vva.chrif.net/api/ai.php -H 'Content-Type: application/json' \
-            --data '{"system":"Reply with only JSON.","user":"Return {\"ok\":true}","maxTokens":20}' || true)
-          if [ "$code" = "200" ]; then echo "  ai: $(jq -r .model /tmp/ai.json)"; else echo "::warning::ai.php returned $code"; fi
+            --data '{"system":"Reply with only JSON.","user":"Return {\"ok\":true}","maxTokens":1024}' || true)
+          if [ "$code" = "200" ]; then echo "  ai: $(jq -r .model /tmp/ai.json)"; else echo "::warning::ai.php returned $code: $(head -c 300 /tmp/ai.json 2>/dev/null)"; fi
 
           echo "all smoke tests passed"

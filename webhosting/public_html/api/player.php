@@ -95,7 +95,7 @@ function yt_player_parallel(string $key, string $id, array $clients, string $vis
     foreach ($handles as $i => $ch) {
         $out[$i] = [
             'status' => (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE),
-            'body' => (string) curl_getcontent($ch),
+            'body' => (string) curl_multi_getcontent($ch),
         ];
         curl_multi_remove_handle($mh, $ch);
         curl_close($ch);

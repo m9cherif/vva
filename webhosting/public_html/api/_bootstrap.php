@@ -59,10 +59,13 @@ function cfg(): array {
         'apiKey'    => env_get('NVIDIA_API_KEY', ''),
         'apiBase'   => rtrim(env_get('NVIDIA_API_BASE', 'https://integrate.api.nvidia.com/v1'), '/'),
         'visionModels' => env_list('VISION_MODELS', [
+            // Chain verified against the live NIM catalog (2026-11): the first
+            // two answer vision requests in ~1-2s; muse-glimmer is slower but
+            // reliable. The old llama-3.2/phi-3 entries are gone — they 404 or
+            // hang now.
             'nvidia/nemotron-3.5-super-vl-120b-a12b',
-            'meta/llama-3.2-90b-vision-instruct',
-            'meta/llama-3.2-11b-vision-instruct',
-            'microsoft/phi-3-vision-128k-instruct',
+            'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
+            'meta/muse-glimmer-30b',
         ]),
         'dataDir'   => $root . '/data',
         'cacheDir'  => $root . '/data/cache',

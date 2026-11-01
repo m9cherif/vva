@@ -71,7 +71,15 @@ function call_model(string $model, array $messages, int $maxTokens, float $tempe
     $data = json_decode($res['body'], true);
     $text = $data['choices'][0]['message']['content'] ?? null;
     if (!is_string($text) || trim($text) === '') {
-        return [false, 'empty content', ['rateLimit' => false, 'serverError' => false, 'empty' => true]];
+        // Reasoning models (nemotron / omni / glimmer) spend the token budget
+        // on a hidden reasoning pass first: with too small a max_tokens they
+        // answer "empty content" forever. Detect that case so the caller can
+        // retry with a bigger budget instead of the same doomed call.
+        $finish = (string) ($data['choices'][0]['finish_reason'] ?? '');
+        $burned = $finish === 'length'
+            || trim((string) ($data['choices'][0]['message']['reasoning_content'] ?? '')) !== '';
+        return [false, $burned ? 'empty content (reasoning model used the whole token budget)' : 'empty content',
+                ['rateLimit' => false, 'serverError' => false, 'empty' => true, 'budget' => $burned]];
     }
     return [true, $text, ['truncated' => ($data['choices'][0]['finish_reason'] ?? '') === 'length']];
 }
@@ -89,10 +97,17 @@ for ($round = 0; $round < $attempts; $round++) {
         $left = $remaining();
         if ($left < 10) break 2;
         [$ok, $text, $meta] = call_model($model, $messages, $maxTokens, $temperature, min($timeout, $left));
-        // Transient trouble on this model (5xx / empty reply) — retry it once before falling through.
+        // Transient trouble on this model (5xx / empty reply) — retry it once
+        // before falling through. A "budget" failure means the reasoning pass
+        // swallowed the whole max_tokens, so the retry gets a much bigger one.
         $tries = 0;
         while ($tries < 2 && !$ok && $remaining() > 25 && (!empty($meta['serverError']) || !empty($meta['empty']))) {
-            $warnings[] = $model . ' ' . (!empty($meta['serverError']) ? 'server error' : 'empty reply') . ' — retrying';
+            if (!empty($meta['budget'])) {
+                $maxTokens = min(8000, max(2048, $maxTokens * 4));
+                $warnings[] = $model . ' spent its token budget reasoning — retrying with max_tokens=' . $maxTokens;
+            } else {
+                $warnings[] = $model . ' ' . (!empty($meta['serverError']) ? 'server error' : 'empty reply') . ' — retrying';
+            }
             [$ok, $text, $meta] = call_model($model, $messages, $maxTokens, $temperature, min($timeout, $remaining()));
             $tries++;
         }

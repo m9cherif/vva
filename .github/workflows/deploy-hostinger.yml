@@ -109,7 +109,7 @@ jobs:
             echo "→ stream resolution (the built-in fallback path)"
             out=$(post https://vva.chrif.net/api/player.php "{\"id\":\"$id\",\"provider\":\"youtube\"}") \
               || fail "player request failed"
-            url=$(jq -r '[.streams[] | select(.kind == "video" and (.mimeType | contains("mp4")))] | first.url // empty' <<<"$out")
+            url=$(jq -r '([(.streams // [])[] | select(.kind == "video" and ((.mimeType // "") | contains("mp4")) | .url)] | first) // empty' <<<"$out")
             if [ -z "$url" ]; then
               echo "::warning::no mp4 stream (YouTube may be blocking CI egress): $(head -c 200 <<<"$out")"
             else

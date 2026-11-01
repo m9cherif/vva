@@ -248,6 +248,26 @@ function innertube_context(string $clientName, string $version, array $extra = [
             'user' => ['lockedSafetyMode' => false]];
 }
 
+/** The visitor token YouTube attaches to a search response. Handing the same
+ *  token to the player call makes both requests look like one browser session —
+ *  without it the player endpoint answers "sign in to confirm you're not a bot"
+ *  far more often. Cached for 6h, best-effort, never fatal. */
+function innertube_visitor(): string {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    $file = cfg()['cacheDir'] . '/innertube_visitor.txt';
+    if (is_file($file) && (time() - filemtime($file)) < 6 * 3600) {
+        $v = trim((string) file_get_contents($file));
+        if ($v !== '') return $cached = $v;
+    }
+    return $cached = '';
+}
+
+function innertube_save_visitor(?string $visitor): void {
+    if (!is_string($visitor) || $visitor === '') return;
+    @file_put_contents(cfg()['cacheDir'] . '/innertube_visitor.txt', $visitor, LOCK_EX);
+}
+
 /** Recursively collect every videoRenderer in an Innertube response. */
 function collect_videos(object|array $node, array &$out): void {
     if (!is_array($node) && !is_object($node)) return;

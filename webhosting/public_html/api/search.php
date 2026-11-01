@@ -31,6 +31,9 @@ try {
     if ($res['status'] !== 200) fail("YouTube search returned HTTP {$res['status']}", 502);
     $data = json_decode($res['body'], true);
     if (!is_array($data)) fail('YouTube search returned malformed data', 502);
+    // Carry the visitor session forward: player.php reuses it so the follow-up
+    // stream request looks like it comes from the browser that just searched.
+    innertube_save_visitor($data['responseContext']['visitorData'] ?? null);
 
     $found = [];
     collect_videos($data, $found);

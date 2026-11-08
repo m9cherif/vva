@@ -1,4 +1,5 @@
-/* Footage acquisition — VidKraken first, built-in downloader as fallback.
+/* Footage acquisition — VidKraken first, then two keyless fallback downloaders,
+ * then the built-in downloader. The SAME video the whole way down.
  *
  * VidKraken (https://vidkraken.com/) is a YouTube download-by-URL API: we POST
  * a video id + a time window, poll the job, and pull a ready-made trimmed MP4
@@ -6,8 +7,17 @@
  * same-origin through api/range.php in bounded 4 MB pieces (shared hosting
  * kills long requests).
  *
- * If VidKraken fails for a video — quota gone, job failed, network — the SAME
- * already-chosen video is fetched through the built-in Innertube + range path.
+ * Their free plan is one-shot (10 downloads, no reset), so when it runs out —
+ * or a job fails — the SAME already-chosen video goes through, in order:
+ *
+ *   1. WebDownloader  save.brianrianrehan.com  (no key; usage-limited server)
+ *      → whole file in ONE pass through api/fallback.php (their URL ignores
+ *        Range, so chunking would re-download the file per chunk).
+ *   2. WeirdDL        weirddl.sbs              (no key)
+ *      → /api/info hands back a DIRECT googlevideo URL with real 206 ranges,
+ *        so it uses the cheap chunked prefix path like VidKraken does.
+ *   3. Built-in Innertube player + range relay.
+ *
  * The research agent never re-chooses anything: only the transport changes.
  */
 import { api, b64url } from './api.js?v=build3';
@@ -18,9 +28,17 @@ const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request
 const MAX_ATTEMPTS = 3;
 const POLL_MS = 1500;                  // VidKraken jobs finish in ~8-30 s
 const JOB_DEADLINE_MS = 180_000;       // never poll a job forever
+const FB_MAX_BYTES = 67_108_864;       // must match FALLBACK_MAX_BYTES server-side
+const FB_STREAM_DEADLINE_MS = 150_000; // one whole-file pass, never longer
+const WD_POLL_MS = 2500;               // WebDownloader renders in ~10-20 s
+const WD_POLL_DEADLINE_MS = 90_000;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function watchUrl(id) {
+  return `https://www.youtube.com/watch?v=${id}`;
 }
 
 async function fetchChunk(url, from, to, onRetry) {
@@ -150,8 +168,114 @@ export async function downloadFallback(video, { windowSec, quality = 480 }, onPr
 }
 
 /**
- * Acquire one source video: VidKraken when it is available, otherwise (or
- * after it fails) the built-in downloader — always the same video.
+ * Pull a whole file through api/fallback.php in ONE pass — used for upstreams
+ * that ignore Range headers (chunking them would re-download the file per
+ * chunk, and these fallback APIs are usage-limited).
+ */
+async function pullViaFallback(fileUrl, onProgress = () => {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FB_STREAM_DEADLINE_MS);
+  try {
+    const res = await fetch(
+      `/api/fallback.php?act=stream&u=${b64url(fileUrl)}&max=${FB_MAX_BYTES}`,
+      { signal: ctrl.signal },
+    );
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { const j = await res.json(); if (j.error) msg = j.error; } catch { /* not JSON */ }
+      throw new Error(msg);
+    }
+    const total = Number(res.headers.get('content-length')) || 0;
+    const reader = res.body.getReader();
+    const parts = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      got += value.byteLength;
+      if (total) onProgress(Math.min(99, Math.round((got / total) * 100)));
+      if (got >= FB_MAX_BYTES) break;
+    }
+    if (!got) throw new Error('empty file');
+    if (total && got < total) throw new Error(`incomplete file (${got} of ${total} bytes)`);
+    onProgress(100);
+    return { blob: new Blob(parts, { type: 'video/mp4' }), bytes: got, total: total || got };
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error(`download timed out after ${Math.round(FB_STREAM_DEADLINE_MS / 1000)}s`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** coveredSec for a file we took whole (no Range support upstream). */
+function coveredByBytes(bytes, total, durationSec) {
+  if (!total || bytes >= total) return durationSec;
+  return Math.max(1, Math.min(durationSec, Math.floor(durationSec * (bytes / total) * 0.95)));
+}
+
+/**
+ * Fallback #1 — WebDownloader (keyless). Submit → poll until their server has
+ * rendered the file → one whole-file pass. Same video, no re-choosing.
+ */
+export async function downloadWebdownloader(video, windowSec, onProgress = () => {}) {
+  const info = await api.fbInfo('webdownloader', watchUrl(video.id));
+  if (!info.downloadUrl) throw new Error(info.error || 'WebDownloader: no file url');
+
+  const t0 = Date.now();
+  for (;;) {
+    let probe = null;
+    try { probe = await api.fbProbe(info.downloadUrl); } catch { /* transient */ }
+    if (probe?.ready) break;
+    if (Date.now() - t0 > WD_POLL_DEADLINE_MS) throw new Error('WebDownloader: file not ready after 90s');
+    onProgress(0, 'WebDownloader is rendering the file…');
+    await sleep(WD_POLL_MS);
+  }
+
+  onProgress(0, 'downloading');
+  const { blob, bytes, total } = await pullViaFallback(info.downloadUrl, (p) => onProgress(p, 'downloading'));
+  const durationSec = info.durationSec || video.duration || windowSec;
+  return {
+    blob,
+    bytes,
+    method: 'webdownloader',
+    coveredSec: coveredByBytes(bytes, total, durationSec),
+  };
+}
+
+/**
+ * Fallback #2 — WeirdDL (keyless). Its /api/info returns a DIRECT googlevideo
+ * URL, which honors byte ranges, so this path is as cheap as VidKraken's: only
+ * the prefix covering the analysis window is pulled.
+ */
+export async function downloadWeirddl(video, windowSec, onProgress = () => {}) {
+  const info = await api.fbInfo('weirddl', watchUrl(video.id));
+  if (!info.streamUrl) throw new Error(info.error || 'WeirdDL: no stream');
+
+  if (info.range) {
+    const dl = await downloadPrefix({
+      url: info.streamUrl,
+      durationSec: info.durationSec || video.duration || windowSec,
+    }, windowSec, onProgress);
+    return { ...dl, method: 'weirddl' };
+  }
+
+  onProgress(0, 'downloading');
+  const { blob, bytes, total } = await pullViaFallback(info.streamUrl, (p) => onProgress(p, 'downloading'));
+  const durationSec = info.durationSec || video.duration || windowSec;
+  return {
+    blob,
+    bytes,
+    method: 'weirddl',
+    coveredSec: coveredByBytes(bytes, total, durationSec),
+  };
+}
+
+/**
+ * Acquire one source video. VidKraken first, then WebDownloader, then WeirdDL,
+ * then the built-in downloader — always the SAME video; every hop only changes
+ * the transport and is reported through onFallback(err, stage).
  *
  * @param {{id: string, duration?: number}} video
  * @param {{windowSec: number, format?: string, quality?: number, useVidkraken?: boolean}} opts
@@ -159,6 +283,8 @@ export async function downloadFallback(video, { windowSec, quality = 480 }, onPr
  */
 export async function acquireFootage(video, opts, hooks = {}) {
   const onProgress = hooks.onProgress || (() => {});
+  const hop = (stage, err) => hooks.onFallback?.(err, stage);
+
   if (opts.useVidkraken !== false) {
     try {
       return await downloadVidkraken(
@@ -166,10 +292,28 @@ export async function acquireFootage(video, opts, hooks = {}) {
         onProgress,
       );
     } catch (err) {
-      hooks.onFallback?.(err);
+      hop('VidKraken', err);
     }
   }
-  return downloadFallback(video, { windowSec: opts.windowSec, quality: opts.quality }, onProgress);
+
+  try {
+    return await downloadWebdownloader(video, opts.windowSec, onProgress);
+  } catch (err) {
+    hop('WebDownloader', err);
+  }
+
+  try {
+    return await downloadWeirddl(video, opts.windowSec, onProgress);
+  } catch (err) {
+    hop('WeirdDL', err);
+  }
+
+  try {
+    return await downloadFallback(video, { windowSec: opts.windowSec, quality: opts.quality }, onProgress);
+  } catch (err) {
+    hop('YouTube', err);
+    throw err;                              // last resort failed: let the caller log it
+  }
 }
 
 /**

@@ -83,7 +83,8 @@ export async function runJob(params, emit) {
     /* 1 ─ Download capacity: VidKraken is metered (the free plan ships a
      * handful of downloads), so ask what is left BEFORE spending anything.
      * A zero balance, a missing key or an unreachable quota check all land in
-     * the same place — the built-in downloader, for the very same videos. */
+     * the same place — WebDownloader → WeirdDL → built-in downloader, for the
+     * very same videos. */
     stageUp('downloading', 11, 'Checking download capacity');
     let quota = null;
     try { quota = await api.vk({ action: 'quota' }); } catch { /* offline or 5xx: stay optimistic */ }
@@ -93,7 +94,7 @@ export async function runJob(params, emit) {
         ? 'VidKraken ready — downloading through it'
         : `VidKraken ready — ${quota.downloads} download${quota.downloads === 1 ? '' : 's'} left on this plan`);
     } else {
-      log(`VidKraken unavailable${quota?.error ? ` (${String(quota.error).slice(0, 90)})` : ' (plan quota exhausted)'} — using the built-in downloader for the same videos`);
+      log(`VidKraken unavailable${quota?.error ? ` (${String(quota.error).slice(0, 90)})` : ' (plan quota exhausted)'} — falling back to WebDownloader → WeirdDL → built-in, same videos`);
     }
 
     /* 2 ─ Footage: one trimmed window per chosen video, VidKraken first.
@@ -123,11 +124,12 @@ export async function runJob(params, emit) {
           useVidkraken,
         }, {
           onProgress: report,
-          onFallback: (err) => log(`↩︎ VidKraken failed for "${entry.title}" — ${String(err.message || err).slice(0, 120)} — same video, built-in downloader`),
+          onFallback: (err, stage) => log(`↩︎ ${stage || 'VidKraken'} failed for "${entry.title}" — ${String(err.message || err).slice(0, 120)} — same video, next downloader`),
         });
         entry.status = 'downloaded'; entry.percent = 100; entry.localDuration = dl.coveredSec;
         srcEvent(entry);
-        log(`Ready "${entry.title}" — ${dl.coveredSec}s window, ${(dl.blob.size / 1048576).toFixed(1)} MB via ${dl.method === 'vidkraken' ? 'VidKraken' : 'built-in downloader'}`);
+        const via = { vidkraken: 'VidKraken', webdownloader: 'WebDownloader', weirddl: 'WeirdDL', innertube: 'built-in downloader' }[dl.method] || dl.method;
+        log(`Ready "${entry.title}" — ${dl.coveredSec}s window, ${(dl.blob.size / 1048576).toFixed(1)} MB via ${via}`);
         prepared.push({ video: entry, blob: dl.blob, duration: dl.coveredSec, height: dl.height || quality, index: idx });
       } catch (err) {
         entry.status = 'failed'; srcEvent(entry);
@@ -156,6 +158,9 @@ export async function runJob(params, emit) {
      * biggest wall-clock cost in a run). */
     stageUp('watching', 48, 'AI vision model is watching every frame');
     const totalFrames = analyze.reduce((n, a) => n + a.frames.length, 0);
+    /* onBatch reports each video's CUMULATIVE frame count, so with parallel
+     * scoring the delta (not the running total) is what advances the bar. */
+    const progressSeen = new Map();
     let doneFrames = 0;
     await mapPool(analyze, 3, async (item) => {
       try {
@@ -163,7 +168,9 @@ export async function runJob(params, emit) {
           interval, videoTitle: item.video.title,
           onBatch: (b) => {
             if (b.model && !job.model) { job.model = b.model; log(`Vision model in use: ${b.model}`); }
-            doneFrames += b.done;
+            const prev = progressSeen.get(item.video.id) || 0;
+            doneFrames += Math.max(0, (b.done || 0) - prev);
+            progressSeen.set(item.video.id, b.done || 0);
             stageUp('watching', 48 + (doneFrames / totalFrames) * 30, `AI watching frames (${doneFrames}/${totalFrames})`);
           },
         });

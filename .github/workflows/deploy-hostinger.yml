@@ -126,6 +126,23 @@ jobs:
               head -c 12 /tmp/chunk.bin | grep -q ftyp || fail "first bytes are not an mp4"
               echo "  206 + Content-Range + ftyp ✓"
             fi
+
+            echo "→ keyless fallback downloaders (WebDownloader → WeirdDL)"
+            # A PHP fatal (500) is our bug and blocks the deploy; an upstream
+            # hiccup (502/timeout) only warns — these services are best-effort.
+            code=$(curl -s -o /tmp/fb.json -w '%{http_code}' --max-time 45 -G \
+              --data-urlencode "act=info" --data-urlencode "src=weirddl" \
+              --data-urlencode "url=https://www.youtube.com/watch?v=$id" \
+              https://vva.chrif.net/api/fallback.php || true)
+            if [ "$code" = "500" ]; then
+              fail "fallback.php crashed: $(head -c 300 /tmp/fb.json 2>/dev/null)"
+            elif [ "$code" != "200" ]; then
+              echo "::warning::fallback.php (weirddl) returned $code: $(head -c 200 /tmp/fb.json 2>/dev/null)"
+            elif [ "$(jq -r '.range' /tmp/fb.json 2>/dev/null)" != "true" ]; then
+              echo "::warning::WeirdDL gave no ranged stream: $(head -c 200 /tmp/fb.json 2>/dev/null)"
+            else
+              echo "  weirddl → $(jq -r '.streamUrl' /tmp/fb.json | cut -c1-64)…"
+            fi
           fi
 
           echo "→ AI endpoint (non-blocking)"

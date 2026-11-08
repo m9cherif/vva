@@ -55,7 +55,9 @@ curl_setopt_array($ch, [
 
 if ($probe) {
     // Ask for the first byte only: cheap, and the response header reveals the total size.
-    curl_setopt($ch, CURLOPT_RANGE, 'bytes=0-0');
+    // libcurl prepends "bytes=" itself: passing 'bytes=0-0' here would send
+    // "Range: bytes=bytes=0-0" and strict CDNs (googlevideo) answer 416.
+    curl_setopt($ch, CURLOPT_RANGE, '0-0');
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     $one = curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);

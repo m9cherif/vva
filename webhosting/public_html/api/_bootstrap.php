@@ -323,13 +323,13 @@ function parse_views(string $text): int {
 }
 
 /** True only for hosts we are willing to relay bytes from (SSRF guard).
- *  Covers the YouTube CDN (the built-in fallback downloader) and the
- *  VidKraken media CDN — proxy.vidkraken.com sends no CORS headers, so every
- *  byte of a VidKraken download has to be relayed same-origin through
- *  range.php. */
+ *  Covers the YouTube CDN (the built-in fallback downloader), the VidKraken
+ *  media CDN — proxy.vidkraken.com sends no CORS headers, so every byte of a
+ *  VidKraken download has to be relayed same-origin through range.php — and
+ *  the two keyless fallback downloaders (WebDownloader, WeirdDL). */
 function is_relay_host(string $host): bool {
     $host = strtolower($host);
-    foreach (['googlevideo.com', 'ytimg.com', 'youtube.com', 'vidkraken.com'] as $d) {
+    foreach (['googlevideo.com', 'ytimg.com', 'youtube.com', 'vidkraken.com', 'brianrianrehan.com', 'weirddl.sbs'] as $d) {
         if ($host === $d || str_ends_with($host, '.' . $d)) return true;
     }
     return false;

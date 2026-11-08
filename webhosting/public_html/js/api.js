@@ -50,6 +50,15 @@ export const api = {
       body: JSON.stringify(payload),
     }, payload.action === 'start' ? 60_000 : 35_000),
 
+  /* Keyless fallback downloaders (WebDownloader → WeirdDL). Only ever used
+   * when VidKraken cannot serve a video, and always for the SAME video the
+   * research agent already chose — the transport changes, the choice never. */
+  fbInfo: (src, watchUrl) =>
+    request(`/api/fallback.php?act=info&src=${encodeURIComponent(src)}&url=${encodeURIComponent(watchUrl)}`, {}, 60_000),
+
+  /* Cheap HEAD poll: WebDownloader answers 409 while it is still rendering. */
+  fbProbe: (fileUrl) => request(`/api/fallback.php?act=probe&u=${b64url(fileUrl)}`, {}, 30_000),
+
   /* AI calls can legitimately take minutes on a cold vision model. */
   ai: (payload) =>
     request('/api/ai.php', {

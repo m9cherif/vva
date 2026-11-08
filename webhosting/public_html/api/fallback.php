@@ -62,6 +62,38 @@ function fallback_is_googlevideo(string $url): bool {
     return $host === 'googlevideo.com' || str_ends_with($host, '.googlevideo.com');
 }
 
+/**
+ * Can THIS server actually pull a byte from that URL?
+ *
+ * A googlevideo URL that looks perfectly valid can still be unusable: the URL
+ * is issued for a particular client and YouTube blocks datacenter IPs, so the
+ * same URL relays fine from a home connection and answers 403 from Hostinger.
+ * "Looks valid" is therefore not enough — the cheap 1-byte probe below is what
+ * decides between the ranged path (prefix only, cheap) and WeirdDL's own
+ * whole-file endpoint (always works, but pulls everything).
+ */
+function fallback_can_relay(string $url): bool {
+    $ch = curl_init($url);
+    $status = 0;
+    curl_setopt_array($ch, [
+        CURLOPT_HTTPHEADER => ['User-Agent: ' . UA_BROWSER, 'Range: bytes=0-0'],
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 2,
+        CURLOPT_TIMEOUT => 8,
+        CURLOPT_CONNECTTIMEOUT => 6,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$status) {
+            if (preg_match('#^HTTP/\S+\s+(\d{3})#', trim($line), $m)) $status = (int) $m[1];
+            return strlen($line);
+        },
+        // Discard the single byte we asked for — never buffer a body here.
+        CURLOPT_WRITEFUNCTION => function ($ch, $chunk) { return strlen($chunk); },
+    ]);
+    curl_exec($ch);
+    curl_close($ch);
+    return $status === 200 || $status === 206;
+}
+
 $act = (string) ($_GET['act'] ?? 'info');
 
 /* ── act=info: resolve a downloadable URL from one of the two APIs ──────── */
@@ -94,7 +126,11 @@ if ($act === 'info') {
             $u = (string) ($m['url'] ?? '');
             if ($u !== '' && fallback_is_googlevideo($u)) { $stream = $u; break; }
         }
-        $ranged = is_string($stream);
+        // The ranged path is only worth advertising if the bytes are actually
+        // fetchable from here (see fallback_can_relay) — otherwise stream
+        // through WeirdDL's own download endpoint: a stable host we already
+        // relay, at the cost of one whole-file pass.
+        $ranged = is_string($stream) && fallback_can_relay($stream);
         if (!$ranged) $stream = 'https://weirddl.sbs/api/download?url=' . rawurlencode($watch);
 
         json_out([

@@ -20,8 +20,8 @@
  *
  * The research agent never re-chooses anything: only the transport changes.
  */
-import { api, b64url } from './api.js?v=build6';
-import { planPrefix } from './mp4.js?v=build6';
+import { api, b64url } from './api.js?v=build7';
+import { planPrefix } from './mp4.js?v=build7';
 
 const HEADER_BYTES = 262_144;          // 256 KB is plenty for ftyp+moov+sidx
 const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request
@@ -31,7 +31,7 @@ const JOB_DEADLINE_MS = 180_000;       // never poll a job forever
 const FB_MAX_BYTES = 67_108_864;       // must match FALLBACK_MAX_BYTES server-side
 const FB_STREAM_DEADLINE_MS = 150_000; // one whole-file pass, never longer
 const WD_POLL_MS = 2500;               // WebDownloader renders in ~10-20 s
-const WD_POLL_DEADLINE_MS = 120_000;   // long compilations can take minutes to render
+const WD_POLL_DEADLINE_MS = 240_000;   // renders finish AFTER 120 s (proven: files polled past the old deadline came back ready)
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -254,7 +254,14 @@ export async function downloadWebdownloader(video, windowSec, onProgress = () =>
     let probe = null;
     try { probe = await api.fbProbe(info.downloadUrl); } catch { /* transient */ }
     if (probe?.ready) break;
-    if (Date.now() - t0 > WD_POLL_DEADLINE_MS) throw new Error('WebDownloader: file not ready after 120s');
+    // A dead job answers with something other than 409 (404/410/…) — keep
+    // waiting only while upstream says it is still rendering.
+    if (probe && !probe.ready && !probe.pending) {
+      throw new Error(`WebDownloader: render failed (HTTP ${probe.status})`);
+    }
+    if (Date.now() - t0 > WD_POLL_DEADLINE_MS) {
+      throw new Error(`WebDownloader: file not ready after ${Math.round(WD_POLL_DEADLINE_MS / 1000)}s`);
+    }
     onProgress(0, 'WebDownloader is rendering the file…');
     await sleep(WD_POLL_MS);
   }
@@ -287,10 +294,12 @@ export async function downloadWeirddl(video, windowSec, onProgress = () => {}) {
       return await weirddlOnce(video, windowSec, onProgress);
     } catch (err) {
       lastErr = err;
-      // Retry only a FAST failure: a quick 422/503/transport error usually
-      // clears on a fresh resolve, but a slow one (timeout) already burned
-      // the whole budget — retrying would double the worst case.
-      if (attempt < 2 && Date.now() - t0 < 15_000) {
+      // Retry unless the attempt was hopeless: quick 422/503/transport errors
+      // clear on a fresh resolve, and so does a single 40 s upstream timeout
+      // (their API answers in 0.9-1.8 s when healthy). The gate sits at 50 s —
+      // just above the server's ~46 s per-try bound — so worst case
+      // (46 + 2 + 46 ≈ 94 s) still fits the 120 s client budget.
+      if (attempt < 2 && Date.now() - t0 < 50_000) {
         onProgress(0, 'WeirdDL hiccup — retrying…');
         await sleep(2000);
       } else {

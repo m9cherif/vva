@@ -7,10 +7,10 @@
  * each chosen video (built-in Innertube download as the same-video fallback) →
  * frames → vision scoring → windows → ffmpeg. Nothing is downloaded twice and
  * the AI never re-picks a video after the research stage. */
-import { api } from './api.js?v=build6';
-import { researchSources } from './agent.js?v=build6';
-import { acquireFootage } from './downloader.js?v=build6';
-import { extractFrames, scoreFrames, generateCopy, cutClip, ffmpeg, onFfmpegLoad } from './media.js?v=build6';
+import { api } from './api.js?v=build7';
+import { researchSources } from './agent.js?v=build7';
+import { acquireFootage } from './downloader.js?v=build7';
+import { extractFrames, scoreFrames, generateCopy, cutClip, ffmpeg, onFfmpegLoad } from './media.js?v=build7';
 
 const interval = 4;   // seconds between scored frames — dense enough to catch a
                       // 10-second payoff, cheap enough to keep runs fast

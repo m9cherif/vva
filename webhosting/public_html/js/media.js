@@ -1,6 +1,6 @@
 /* Browser media engine: frame sampling via <video>+canvas, and clip cutting
  * via ffmpeg.wasm (single-threaded core — the COOP/COEP headers enable it). */
-import { api, extractJson } from './api.js?v=build4';
+import { api, extractJson } from './api.js?v=build5';
 
 /* ── frames ─────────────────────────────────────────────────────────────── */
 export async function extractFrames(blob, { intervalSec = 6, width = 384, limitSec = 0, onProgress = () => {} } = {}) {

@@ -20,8 +20,8 @@
  *
  * The research agent never re-chooses anything: only the transport changes.
  */
-import { api, b64url } from './api.js?v=build4';
-import { planPrefix } from './mp4.js?v=build4';
+import { api, b64url } from './api.js?v=build5';
+import { planPrefix } from './mp4.js?v=build5';
 
 const HEADER_BYTES = 262_144;          // 256 KB is plenty for ftyp+moov+sidx
 const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request
@@ -39,6 +39,19 @@ function sleep(ms) {
 
 function watchUrl(id) {
   return `https://www.youtube.com/watch?v=${id}`;
+}
+
+/* WebDownloader's free API cannot take concurrent submits from one client:
+ * a real run's network log showed three simultaneous submits all hanging
+ * past the 120 s budget, while the solo submit that followed answered in
+ * 21 s (and our own probe showed 8 at once → 7× HTTP 429). So exactly ONE
+ * submit is in flight at a time; the others wait their turn. The lock covers
+ * only the submit — the render poll and the byte pulls stay concurrent. */
+let wdSubmitLock = Promise.resolve();
+function wdSubmit(fn) {
+  const run = wdSubmitLock.then(fn, fn);
+  wdSubmitLock = run.then(() => undefined, () => undefined); // never chain failures
+  return run;
 }
 
 async function fetchChunk(url, from, to, onRetry) {
@@ -231,7 +244,9 @@ function coveredByBytes(bytes, total, durationSec, windowSec) {
  * rendered the file → one whole-file pass. Same video, no re-choosing.
  */
 export async function downloadWebdownloader(video, windowSec, onProgress = () => {}, format) {
-  const info = await api.fbInfo('webdownloader', watchUrl(video.id), format);
+  // Serialized: their API hangs/429s on parallel submits (see wdSubmit).
+  onProgress(0, 'submitting to WebDownloader…');
+  const info = await wdSubmit(() => api.fbInfo('webdownloader', watchUrl(video.id), format));
   if (!info.downloadUrl) throw new Error(info.error || 'WebDownloader: no file url');
 
   const t0 = Date.now();
@@ -259,8 +274,28 @@ export async function downloadWebdownloader(video, windowSec, onProgress = () =>
  * Fallback #2 — WeirdDL (keyless). Its /api/info returns a DIRECT googlevideo
  * URL, which honors byte ranges, so this path is as cheap as VidKraken's: only
  * the prefix covering the analysis window is pulled.
+ *
+ * One retry: their endpoints answer with transient upstream errors (a real
+ * run died on a 422 and the source fell all the way through to the dead
+ * built-in hop), and the SAME video with a fresh resolve usually goes through.
  */
 export async function downloadWeirddl(video, windowSec, onProgress = () => {}) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await weirddlOnce(video, windowSec, onProgress);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 2) {
+        onProgress(0, 'WeirdDL hiccup — retrying…');
+        await sleep(2000);
+      }
+    }
+  }
+  throw lastErr;
+}
+
+async function weirddlOnce(video, windowSec, onProgress) {
   const info = await api.fbInfo('weirddl', watchUrl(video.id));
   if (!info.streamUrl) throw new Error(info.error || 'WeirdDL: no stream');
 

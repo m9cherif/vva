@@ -163,10 +163,11 @@ if ($act === 'info') {
                 ['url' => $watch, 'format' => 'video', 'quality' => $quality, 'outputFormat' => 'mp4'],
                 [],
                 // No retry here (a timed-out submit may still have queued a job
-                // server-side; repeating it would burn their usage limit), but a
-                // generous budget: extraction of a long compilation took >60 s in
-                // a real run, which starved this whole first fallback hop.
-                90,
+                // server-side; repeating it would burn their usage limit). The
+                // budget is SHORT on purpose: a healthy solo submit answers in
+                // 11-21 s; a hung one never answers at all, so holding a shared
+                // hosting worker for longer only delays every other request.
+                45,
                 15
             );
         } catch (Throwable $e) {

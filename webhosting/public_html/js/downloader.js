@@ -20,8 +20,8 @@
  *
  * The research agent never re-chooses anything: only the transport changes.
  */
-import { api, b64url } from './api.js?v=build3';
-import { planPrefix } from './mp4.js?v=build3';
+import { api, b64url } from './api.js?v=build4';
+import { planPrefix } from './mp4.js?v=build4';
 
 const HEADER_BYTES = 262_144;          // 256 KB is plenty for ftyp+moov+sidx
 const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request

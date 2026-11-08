@@ -31,7 +31,7 @@ const JOB_DEADLINE_MS = 180_000;       // never poll a job forever
 const FB_MAX_BYTES = 67_108_864;       // must match FALLBACK_MAX_BYTES server-side
 const FB_STREAM_DEADLINE_MS = 150_000; // one whole-file pass, never longer
 const WD_POLL_MS = 2500;               // WebDownloader renders in ~10-20 s
-const WD_POLL_DEADLINE_MS = 90_000;
+const WD_POLL_DEADLINE_MS = 120_000;   // long compilations can take minutes to render
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -186,6 +186,12 @@ async function pullViaFallback(fileUrl, onProgress = () => {}) {
       throw new Error(msg);
     }
     const total = Number(res.headers.get('content-length')) || 0;
+    // When the relay hit its 64 MB ceiling it sends X-File-Total (the REAL
+    // upstream size) + X-Truncated — content-length is then just the cap, and
+    // coveredSec must be computed from the real total, not treated as a
+    // complete file.
+    const realTotal = Number(res.headers.get('x-file-total')) || total;
+    const truncated = res.headers.get('x-truncated') === '1';
     const reader = res.body.getReader();
     const parts = [];
     let got = 0;
@@ -194,13 +200,13 @@ async function pullViaFallback(fileUrl, onProgress = () => {}) {
       if (done) break;
       parts.push(value);
       got += value.byteLength;
-      if (total) onProgress(Math.min(99, Math.round((got / total) * 100)));
+      if (realTotal) onProgress(Math.min(99, Math.round((got / realTotal) * 100)));
       if (got >= FB_MAX_BYTES) break;
     }
     if (!got) throw new Error('empty file');
-    if (total && got < total) throw new Error(`incomplete file (${got} of ${total} bytes)`);
+    if (!truncated && total && got < total) throw new Error(`incomplete file (${got} of ${total} bytes)`);
     onProgress(100);
-    return { blob: new Blob(parts, { type: 'video/mp4' }), bytes: got, total: total || got };
+    return { blob: new Blob(parts, { type: 'video/mp4' }), bytes: got, total: realTotal || got };
   } catch (err) {
     if (err.name === 'AbortError') throw new Error(`download timed out after ${Math.round(FB_STREAM_DEADLINE_MS / 1000)}s`);
     throw err;
@@ -224,8 +230,8 @@ function coveredByBytes(bytes, total, durationSec, windowSec) {
  * Fallback #1 — WebDownloader (keyless). Submit → poll until their server has
  * rendered the file → one whole-file pass. Same video, no re-choosing.
  */
-export async function downloadWebdownloader(video, windowSec, onProgress = () => {}) {
-  const info = await api.fbInfo('webdownloader', watchUrl(video.id));
+export async function downloadWebdownloader(video, windowSec, onProgress = () => {}, format) {
+  const info = await api.fbInfo('webdownloader', watchUrl(video.id), format);
   if (!info.downloadUrl) throw new Error(info.error || 'WebDownloader: no file url');
 
   const t0 = Date.now();
@@ -233,7 +239,7 @@ export async function downloadWebdownloader(video, windowSec, onProgress = () =>
     let probe = null;
     try { probe = await api.fbProbe(info.downloadUrl); } catch { /* transient */ }
     if (probe?.ready) break;
-    if (Date.now() - t0 > WD_POLL_DEADLINE_MS) throw new Error('WebDownloader: file not ready after 90s');
+    if (Date.now() - t0 > WD_POLL_DEADLINE_MS) throw new Error('WebDownloader: file not ready after 120s');
     onProgress(0, 'WebDownloader is rendering the file…');
     await sleep(WD_POLL_MS);
   }
@@ -302,7 +308,7 @@ export async function acquireFootage(video, opts, hooks = {}) {
   }
 
   try {
-    return await downloadWebdownloader(video, opts.windowSec, onProgress);
+    return await downloadWebdownloader(video, opts.windowSec, onProgress, opts.format);
   } catch (err) {
     hop('WebDownloader', err);
   }

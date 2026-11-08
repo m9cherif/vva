@@ -52,9 +52,17 @@ export const api = {
 
   /* Keyless fallback downloaders (WebDownloader → WeirdDL). Only ever used
    * when VidKraken cannot serve a video, and always for the SAME video the
-   * research agent already chose — the transport changes, the choice never. */
-  fbInfo: (src, watchUrl) =>
-    request(`/api/fallback.php?act=info&src=${encodeURIComponent(src)}&url=${encodeURIComponent(watchUrl)}`, {}, 60_000),
+   * research agent already chose — the transport changes, the choice never.
+   * WebDownloader's submit takes 10-90 s (longer videos = longer extraction),
+   * so this call is allowed two minutes — the old 60 s budget killed the whole
+   * first fallback hop on every compilation-length source. */
+  fbInfo: (src, watchUrl, quality) =>
+    request(
+      `/api/fallback.php?act=info&src=${encodeURIComponent(src)}&url=${encodeURIComponent(watchUrl)}`
+      + (quality ? `&q=${encodeURIComponent(quality)}` : ''),
+      {},
+      120_000,
+    ),
 
   /* Cheap HEAD poll: WebDownloader answers 409 while it is still rendering. */
   fbProbe: (fileUrl) => request(`/api/fallback.php?act=probe&u=${b64url(fileUrl)}`, {}, 30_000),

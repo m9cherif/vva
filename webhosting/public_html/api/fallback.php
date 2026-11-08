@@ -102,13 +102,22 @@ if ($act === 'info') {
     $watch = fallback_watch_url();
 
     if ($src === 'weirddl') {
-        // http_get_json THROWS on transport failure — an uncaught exception here
+        // http_get_json THROWS on transport failure — an uncaught exception
         // would end the script with an empty body instead of a JSON error.
-        try {
-            $res = http_get_json('https://weirddl.sbs/api/info?url=' . rawurlencode($watch), [], 30);
-        } catch (Throwable $e) {
-            fail('WeirdDL unreachable: ' . $e->getMessage(), 502);
+        // One retry: a real run showed an occasional transport error here that
+        // cost the source its whole chain.
+        $res = null;
+        $lastErr = null;
+        for ($try = 0; $try < 2; $try++) {
+            try {
+                $res = http_get_json('https://weirddl.sbs/api/info?url=' . rawurlencode($watch), [], 45);
+                break;
+            } catch (Throwable $e) {
+                $lastErr = $e;
+                usleep(500000);
+            }
         }
+        if ($res === null) fail('WeirdDL unreachable: ' . $lastErr->getMessage(), 502);
         if ($res['status'] !== 200) fail('WeirdDL HTTP ' . $res['status'], 502);
         $data = json_decode($res['body'], true);
         if (!is_array($data)) fail('WeirdDL returned no data', 502);
@@ -143,12 +152,21 @@ if ($act === 'info') {
     }
 
     if ($src === 'webdownloader') {
+        // Ask for the resolution the pipeline actually uses: "best" pulls 1080p
+        // — huge files that risk the 64 MB ceiling — for footage that is only
+        // ever analysed and cut at 480/720 anyway.
+        $q = (string) ($_GET['q'] ?? '');
+        $quality = in_array($q, ['1080', '720'], true) ? $q . 'p' : '480p';
         try {
             $res = http_post_json(
                 'https://save.brianrianrehan.com/api/v1/download?wait=false&download=false',
-                ['url' => $watch, 'format' => 'video', 'quality' => 'best', 'outputFormat' => 'mp4'],
+                ['url' => $watch, 'format' => 'video', 'quality' => $quality, 'outputFormat' => 'mp4'],
                 [],
-                60,
+                // No retry here (a timed-out submit may still have queued a job
+                // server-side; repeating it would burn their usage limit), but a
+                // generous budget: extraction of a long compilation took >60 s in
+                // a real run, which starved this whole first fallback hop.
+                90,
                 15
             );
         } catch (Throwable $e) {
@@ -290,6 +308,12 @@ if ($act === 'stream') {
                 http_response_code(200);
                 header('Content-Type: ' . ($headers['content-type'] ?? 'video/mp4'));
                 if ($total > 0) header('Content-Length: ' . min($total, $cap));
+                if ($total > $cap) {
+                    // The body stops at the ceiling, but the CLIENT needs the
+                    // real size to know how much of the video those bytes are.
+                    header('X-File-Total: ' . $total);
+                    header('X-Truncated: 1');
+                }
             }
             header('Accept-Ranges: bytes');
             header('Cache-Control: no-store');

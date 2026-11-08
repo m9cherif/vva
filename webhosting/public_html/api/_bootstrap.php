@@ -177,9 +177,11 @@ function http_get_json(string $url, array $headers = [], int $timeout = 30): arr
             CURLOPT_USERAGENT => UA_BROWSER,
         ]);
         $out = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $error = curl_error($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
-        if ($out === false) throw new RuntimeException('HTTP request failed: ' . curl_strerror(0));
+        if ($out === false) throw new RuntimeException("HTTP request failed ({$errno}): {$error}");
         return ['status' => $status, 'body' => (string) $out];
     }
     $ctx = stream_context_create(['http' => [

@@ -1,8 +1,8 @@
 /* ViralClips AI — front-end controller (shared-hosting build)
  * Same UI as the Node app; the pipeline itself now runs HERE, in the browser,
  * driven by js/pipeline.js. The server only ever sees short PHP requests. */
-import { api } from './api.js?v=build5';
-import { runJob } from './pipeline.js?v=build5';
+import { api } from './api.js?v=build6';
+import { runJob } from './pipeline.js?v=build6';
 
 const $ = (s) => document.querySelector(s);
 

@@ -1,4 +1,4 @@
-import { api, extractJson } from './api.js?v=build5';
+import { api, extractJson } from './api.js?v=build6';
 const MAX_SEARCHES = 4, MAX_ROUNDS = 10, IMAGES_PER_TURN = 8;
 
 /* Selection bar, in priority order. The old prompt only said "prefer" things,

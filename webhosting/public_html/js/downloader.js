@@ -20,8 +20,8 @@
  *
  * The research agent never re-chooses anything: only the transport changes.
  */
-import { api, b64url } from './api.js?v=build5';
-import { planPrefix } from './mp4.js?v=build5';
+import { api, b64url } from './api.js?v=build6';
+import { planPrefix } from './mp4.js?v=build6';
 
 const HEADER_BYTES = 262_144;          // 256 KB is plenty for ftyp+moov+sidx
 const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request
@@ -282,13 +282,19 @@ export async function downloadWebdownloader(video, windowSec, onProgress = () =>
 export async function downloadWeirddl(video, windowSec, onProgress = () => {}) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
+    const t0 = Date.now();
     try {
       return await weirddlOnce(video, windowSec, onProgress);
     } catch (err) {
       lastErr = err;
-      if (attempt < 2) {
+      // Retry only a FAST failure: a quick 422/503/transport error usually
+      // clears on a fresh resolve, but a slow one (timeout) already burned
+      // the whole budget — retrying would double the worst case.
+      if (attempt < 2 && Date.now() - t0 < 15_000) {
         onProgress(0, 'WeirdDL hiccup — retrying…');
         await sleep(2000);
+      } else {
+        break;
       }
     }
   }

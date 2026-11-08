@@ -58,8 +58,9 @@ export const api = {
    * submit in 11-21 s but hangs indefinitely when submits arrive concurrently
    * (see the submit lock in downloader.js) — so 60 s is already 3x a healthy
    * answer, and waiting longer only starves the chain. WeirdDL's /api/info
-   * legitimately needs 50-55 s (their API + our 1-byte relay probe), and the
-   * server may retry a transport error once, so it keeps 120 s. */
+   * legitimately needs up to ~50 s (their API + our 1-byte relay probe, now
+   * bounded to one 40 s try server-side); 120 s is the backstop for a request
+   * Hostinger may queue behind other PHP workers. */
   fbInfo: (src, watchUrl, quality) =>
     request(
       `/api/fallback.php?act=info&src=${encodeURIComponent(src)}&url=${encodeURIComponent(watchUrl)}`

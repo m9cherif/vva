@@ -79,8 +79,8 @@ function fallback_can_relay(string $url): bool {
         CURLOPT_HTTPHEADER => ['User-Agent: ' . UA_BROWSER, 'Range: bytes=0-0'],
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS => 2,
-        CURLOPT_TIMEOUT => 8,
-        CURLOPT_CONNECTTIMEOUT => 6,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_CONNECTTIMEOUT => 4,
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$status) {
             if (preg_match('#^HTTP/\S+\s+(\d{3})#', trim($line), $m)) $status = (int) $m[1];
@@ -102,22 +102,18 @@ if ($act === 'info') {
     $watch = fallback_watch_url();
 
     if ($src === 'weirddl') {
-        // http_get_json THROWS on transport failure — an uncaught exception
-        // would end the script with an empty body instead of a JSON error.
-        // One retry: a real run showed an occasional transport error here that
-        // cost the source its whole chain.
-        $res = null;
-        $lastErr = null;
-        for ($try = 0; $try < 2; $try++) {
-            try {
-                $res = http_get_json('https://weirddl.sbs/api/info?url=' . rawurlencode($watch), [], 45);
-                break;
-            } catch (Throwable $e) {
-                $lastErr = $e;
-                usleep(500000);
-            }
+        // ONE try, short budget. A slow upstream must not pin a shared-hosting
+        // PHP worker: Hostinger answers 503 ("server is temporarily busy") to
+        // everything else once the pool is saturated, which cascades into the
+        // whole pipeline. The browser retries a fast transport failure itself
+        // (see downloadWeirddl), so a server-side retry only doubles holds.
+        // http_get_json THROWS on transport failure — uncaught it would end
+        // the script with an empty body instead of a JSON error.
+        try {
+            $res = http_get_json('https://weirddl.sbs/api/info?url=' . rawurlencode($watch), [], 40);
+        } catch (Throwable $e) {
+            fail('WeirdDL unreachable: ' . $e->getMessage(), 502);
         }
-        if ($res === null) fail('WeirdDL unreachable: ' . $lastErr->getMessage(), 502);
         if ($res['status'] !== 200) fail('WeirdDL HTTP ' . $res['status'], 502);
         $data = json_decode($res['body'], true);
         if (!is_array($data)) fail('WeirdDL returned no data', 502);
@@ -165,9 +161,10 @@ if ($act === 'info') {
                 // No retry here (a timed-out submit may still have queued a job
                 // server-side; repeating it would burn their usage limit). The
                 // budget is SHORT on purpose: a healthy solo submit answers in
-                // 11-21 s; a hung one never answers at all, so holding a shared
-                // hosting worker for longer only delays every other request.
-                45,
+                // 11-21 s; a hung one never answers at all, and every second
+                // this holds a shared-hosting PHP worker is a second something
+                // else gets Hostinger's 503 ("server is temporarily busy").
+                30,
                 15
             );
         } catch (Throwable $e) {

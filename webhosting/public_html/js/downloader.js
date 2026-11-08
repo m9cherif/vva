@@ -209,10 +209,15 @@ async function pullViaFallback(fileUrl, onProgress = () => {}) {
   }
 }
 
-/** coveredSec for a file we took whole (no Range support upstream). */
-function coveredByBytes(bytes, total, durationSec) {
-  if (!total || bytes >= total) return durationSec;
-  return Math.max(1, Math.min(durationSec, Math.floor(durationSec * (bytes / total) * 0.95)));
+/** coveredSec for a file we took whole (no Range support upstream).
+ *  Never exceeds the analysis window: VidKraken and the Innertube path both
+ *  deliver [0, windowSec], so the frame sampler and the cutter must agree on
+ *  the same span — otherwise one long source would balloon the frame count. */
+function coveredByBytes(bytes, total, durationSec, windowSec) {
+  const full = (!total || bytes >= total)
+    ? durationSec
+    : Math.max(1, Math.floor(durationSec * (bytes / total) * 0.95));
+  return Math.max(1, Math.min(full, windowSec, durationSec || windowSec));
 }
 
 /**
@@ -240,7 +245,7 @@ export async function downloadWebdownloader(video, windowSec, onProgress = () =>
     blob,
     bytes,
     method: 'webdownloader',
-    coveredSec: coveredByBytes(bytes, total, durationSec),
+    coveredSec: coveredByBytes(bytes, total, durationSec, windowSec),
   };
 }
 
@@ -268,7 +273,7 @@ export async function downloadWeirddl(video, windowSec, onProgress = () => {}) {
     blob,
     bytes,
     method: 'weirddl',
-    coveredSec: coveredByBytes(bytes, total, durationSec),
+    coveredSec: coveredByBytes(bytes, total, durationSec, windowSec),
   };
 }
 

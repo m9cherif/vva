@@ -20,8 +20,8 @@
  *
  * The research agent never re-chooses anything: only the transport changes.
  */
-import { api, b64url } from './api.js?v=build7';
-import { planPrefix } from './mp4.js?v=build7';
+import { api, b64url } from './api.js?v=build8';
+import { planPrefix } from './mp4.js?v=build8';
 
 const HEADER_BYTES = 262_144;          // 256 KB is plenty for ftyp+moov+sidx
 const CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MB per relay request
@@ -200,11 +200,9 @@ async function pullViaFallback(fileUrl, onProgress = () => {}) {
     }
     const total = Number(res.headers.get('content-length')) || 0;
     // When the relay hit its 64 MB ceiling it sends X-File-Total (the REAL
-    // upstream size) + X-Truncated — content-length is then just the cap, and
-    // coveredSec must be computed from the real total, not treated as a
-    // complete file.
+    // upstream size) so coveredSec is computed from that, never mistaking the
+    // cap for a complete file.
     const realTotal = Number(res.headers.get('x-file-total')) || total;
-    const truncated = res.headers.get('x-truncated') === '1';
     const reader = res.body.getReader();
     const parts = [];
     let got = 0;
@@ -217,7 +215,10 @@ async function pullViaFallback(fileUrl, onProgress = () => {}) {
       if (got >= FB_MAX_BYTES) break;
     }
     if (!got) throw new Error('empty file');
-    if (!truncated && total && got < total) throw new Error(`incomplete file (${got} of ${total} bytes)`);
+    // A capped response still advertises content-length = min(real size, cap)
+    // and stops exactly there, so ANY short body means the upstream connection
+    // died mid-file. Accepting it built a blob no decoder could play.
+    if (total && got < total) throw new Error(`incomplete file (${got} of ${total} bytes)`);
     onProgress(100);
     return { blob: new Blob(parts, { type: 'video/mp4' }), bytes: got, total: realTotal || got };
   } catch (err) {
@@ -245,15 +246,32 @@ function coveredByBytes(bytes, total, durationSec, windowSec) {
  */
 export async function downloadWebdownloader(video, windowSec, onProgress = () => {}, format) {
   // Serialized: their API hangs/429s on parallel submits (see wdSubmit).
+  //
+  // Quality is chosen from the source's LENGTH, before submitting: the relay
+  // can only carry 64 MB, and a 6-minute compilation renders ~103 MB at 720p —
+  // a capped pull of that is an unplayable fragment. Asking for a smaller
+  // rendition is the only way such a source can come through WebDownloader at
+  // all (the probe still rejects anything that lands above the ceiling).
+  const dur = Number(video.duration) || 0;
+  const q = dur > 300 ? '360' : dur > 150 ? '480' : format;
   onProgress(0, 'submitting to WebDownloader…');
-  const info = await wdSubmit(() => api.fbInfo('webdownloader', watchUrl(video.id), format));
+  const info = await wdSubmit(() => api.fbInfo('webdownloader', watchUrl(video.id), q));
   if (!info.downloadUrl) throw new Error(info.error || 'WebDownloader: no file url');
 
   const t0 = Date.now();
   for (;;) {
     let probe = null;
     try { probe = await api.fbProbe(info.downloadUrl); } catch { /* transient */ }
-    if (probe?.ready) break;
+    if (probe?.ready) {
+      // A file bigger than the relay ceiling cannot be fetched whole, and a
+      // capped pull of these MP4s is an unplayable fragment (moov sits at the
+      // end). Skip the hop NOW so the same video reaches the next downloader
+      // instead of burning the poll budget and then failing to decode.
+      if (probe.length > FB_MAX_BYTES) {
+        throw new Error(`WebDownloader: file is ${Math.round(probe.length / 1048576)} MB, above the ${Math.round(FB_MAX_BYTES / 1048576)} MB relay limit`);
+      }
+      break;
+    }
     // A dead job answers with something other than 409 (404/410/…) — keep
     // waiting only while upstream says it is still rendering.
     if (probe && !probe.ready && !probe.pending) {

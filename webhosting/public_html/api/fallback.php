@@ -202,10 +202,20 @@ if ($act === 'probe') {
     ]);
     curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    // Real file size (0 when the upstream hides it). The client uses this to
+    // skip a file that cannot fit through the 64 MB relay at all, instead of
+    // spending its whole poll budget and then pulling a truncated MP4 that no
+    // decoder can play.
+    $length = (int) curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T);
     $err = curl_error($ch);
     curl_close($ch);
     if ($status === 0) fail('upstream probe failed: ' . ($err !== '' ? $err : 'no response'), 502);
-    json_out(['ready' => $status === 200, 'status' => $status, 'pending' => $status === 409]);
+    json_out([
+        'ready' => $status === 200,
+        'status' => $status,
+        'pending' => $status === 409,
+        'length' => $length > 0 ? $length : 0,
+    ]);
 }
 
 /* ── act=stream: bounded byte relay with Range emulation ───────────────── */
